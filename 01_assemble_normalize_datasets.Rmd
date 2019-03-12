@@ -1,0 +1,195 @@
+
+```{r loading}
+# library(synExtra)
+library(tidyverse)
+library(biomaRt)
+library(DESeq2)
+
+paste_ <- function(...) {
+  paste(..., sep = "_")
+}
+```
+
+# CDK dataset
+
+CDK4/6 inhibitor dataset collected by Caitlin Mills
+
+# Reading data
+
+
+```{r read_cdk_data}
+cdk_bulk_meta <- readr::read_csv(file.path("wrangled", "cdk_bulk_meta.csv"))
+cdk_bulk_counts <- readr::read_csv(file.path("wrangled", "cdk_bulk_counts.csv.gz"))
+cdk_dge_meta <- readr::read_csv(file.path("wrangled", "cdk_dge_meta.csv"))
+cdk_dge_counts <- readr::read_csv(file.path("wrangled", "cdk_dge_counts.csv.gz"))
+
+cdk_meta_combined <- readr::read_csv(file.path("wrangled", "cdk_meta_combined.csv"))
+cdk_count_combined <- readr::read_csv(file.path("wrangled", "cdk_count_combined.csv.gz"))
+cdk_meta_matched_samples <- readr::read_rds(file.path("wrangled", "cdk_meta_matched_samples.rds"))
+
+ensembl_gene_id_mapping <- readr::read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv"))
+```
+
+## Sample table
+
+```{r cdk_meta_table}
+ggsave(file.path("sample_matching", "cdk_metadata_head.pdf"), gridExtra::tableGrob(head(dplyr::arrange(cdk_meta_combined, method, cell_line, time, drug, concentration))))
+
+```
+
+
+## Planned analyses
+
+* Fraction of zeros, plot per gene across samples, bulk vs. dge
+* Correlation gene expression, stratified by expression level?
+* Normalize counts with DESeq2
+* UpsetR concordance zeros across cell-lines/treatments
+* Weighted jaccard similarity for comparing similarity of gene sets between
+  drugs
+* Dispersion estimate DGE vs. bulk
+* Concordance differential expression DGE vs. bulk, L1000 genes and not
+
+
+## Normalizing counts
+
+Using DESeq2 to normalize contact counts.
+
+Checking whether it makes a difference to normalize by using `median` or
+`genefilter::shorth` as location function. `shorth` supposed to work better for
+smaller counts (DGE?). Doesn't make any difference though, sticking with default
+`median`.
+
+```{r deseq_normalization}
+cdk_meta_deseq <- cdk_meta_combined %>%
+  # Generate unique id for each combination of exp parameters
+  dplyr::mutate(condition = paste_(method, cell_line, drug, concentration, time)) %>%
+  as.data.frame() %>%
+  `rownames<-`(.$sample_id)
+
+cdk_count_deseq <- cdk_count_combined %>%
+  dplyr::select(-method, -symbol) %>%
+  tidyr::spread(sample_id, count) %>%
+  as.data.frame() %>%
+  `rownames<-`(.$ensembl_gene_id) %>%
+  dplyr::select(-ensembl_gene_id)
+
+locfuncs <- list(
+  "shorth" = genefilter::shorth,
+  "median" = median
+) 
+deseq_all <- locfuncs %>%
+  purrr::map(
+    ~DESeq2::DESeqDataSetFromMatrix(
+      countData = cdk_count_deseq,
+      colData = cdk_meta_deseq,
+      design = ~ condition
+    ) %>%
+      DESeq2::estimateSizeFactors(locfunc = .x)
+  ) %>%
+  set_names(names(locfuncs))
+  
+normalized_counts_all <- deseq_all %>%
+  purrr::map(
+    ~DESeq2::counts(.x, normalized = TRUE) %>%
+      as.data.frame() %>%
+      dplyr::mutate(gene_id = row.names(.x))
+  ) %>%
+  dplyr::bind_rows(.id = "locfunc")
+
+norm_shorth_vs_median <- normalized_counts_all %>%
+  tidyr::gather(key = "sample", value = "normcount", -locfunc, -gene_id) %>%
+  tidyr::spread(locfunc, normcount)
+
+p <- norm_shorth_vs_median %>%
+  dplyr::filter(sample %in% sample(unique(.$sample), 9)) %>%
+  ggplot(
+    aes(median, shorth)
+  ) +
+    geom_point() +
+    scale_y_log10() +
+    scale_x_log10() +
+    facet_wrap(~sample)
+dir.create("QC", showWarnings = FALSE)
+ggsave(file.path("QC", "norm_shorth_vs_media.pdf"), p)
+
+# Since there's no difference in results of locfuncs, just using median
+normalized_counts_all <- normalized_counts_all %>%
+  dplyr::filter(locfunc == "median") %>%
+  dplyr::select(-locfunc) %>%
+  tidyr::gather(key = "sample_id", value = "count", -gene_id)
+
+# Creating some useful subsets of samples with specific properties.
+# MCF7 treated with Abemaciclibat is the only condition where DGE and bulk match
+# perfectly over all parameters (see sample_matching/matched_sample_table.pdf)
+
+subset_sample_ids_2_rep <- cdk_meta_deseq %>%
+  dplyr::arrange(condition) %>%
+  dplyr::group_by(condition) %>%
+  dplyr::filter(n() > 1) %>%
+  .$sample_id
+
+subsets_sample_ids <- list(
+  "dge" = dplyr::filter(cdk_meta_combined, method == "dge")$sample_id,
+  "bulk" = dplyr::filter(cdk_meta_combined, method == "bulk")$sample_id,
+  "dge_2_rep" = dplyr::filter(cdk_meta_combined, method == "dge")$sample_id %>%
+    intersect(subset_sample_ids_2_rep),
+  "bulk_2_rep" = dplyr::filter(cdk_meta_combined, method == "bulk")$sample_id %>%
+    intersect(subset_sample_ids_2_rep),
+  "matched" = dplyr::filter(cdk_meta_matched_samples, bulk > 0, dge > 0)$sample_ids %>%
+    purrr::reduce(union),
+  "matched_2_rep" = dplyr::filter(cdk_meta_matched_samples, bulk > 1, dge > 1)$sample_ids %>%
+    purrr::reduce(union),
+  "mcf7_abemaciclib" = dplyr::filter(cdk_meta_matched_samples, cell_line == "MCF7", drug %in% c("Abemaciclib", "DMSO"), bulk > 1, dge > 1)$sample_ids %>%
+    purrr::reduce(union)
+)
+readr::write_rds(subsets_sample_ids, file.path("sample_matching", "sample_subsets_list.rds"))
+
+# Creating DESeq2 objects fo each sample subset with a simple ~condition
+# design formula
+
+
+deseq <- subsets_sample_ids %>%
+  purrr::map(
+    ~DESeq2::DESeqDataSetFromMatrix(
+      cdk_count_deseq %>%
+        dplyr::select_at(dplyr::vars(dplyr::one_of(sort(.x)))),
+      cdk_meta_deseq %>%
+        dplyr::filter(sample_id %in% .x) %>%
+        dplyr::arrange(sample_id),
+      design = ~condition
+    ) %>%
+      DESeq2::DESeq()
+  )
+dir.create("deseq", showWarnings = FALSE)
+readr::write_rds(deseq, file.path("deseq", "deseq_datasets.rds"))
+```
+
+## Count data
+
+```{r calculate_counts}
+count_funcs <- list(
+  raw = . %>%
+    DESeq2::counts(normalized = FALSE) %>%
+    as_tibble(rownames = "gene_id"),
+  normalized = . %>%
+    DESeq2::counts(normalized = TRUE) %>%
+    as_tibble(rownames = "gene_id"),
+  variance_stabilized = . %>%
+    DESeq2::vst() %>%
+    SummarizedExperiment::assay() %>%
+    as_tibble(rownames = "gene_id")
+)
+
+counts <- deseq %>%
+  map(
+    function (de) {
+      count_funcs %>%
+        map(~.x(de)) %>%
+        map(gather, key = "sample_id", value = "count", -gene_id) %>%
+        bind_rows(.id = "normalization")
+    }
+  ) %>%
+  bind_rows(.id = "comparison")
+write_csv(counts, file.path("deseq", "count_data.csv.gz"))
+
+```
