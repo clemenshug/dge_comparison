@@ -42,7 +42,7 @@ l1000_ensembl_gene_ids <- l1000 %>%
 ```{r detected_l1000_genes}
 l1000_counts <- counts %>%
   filter(comparison %in% c("dge", "bulk"), normalization == "raw") %>%
-  mutate(in_l1000 = gene_id %in% l1000_ensembl_gene_ids)
+  mutate(l1000 = ifelse(gene_id %in% l1000_ensembl_gene_ids, "l1000", "not_l1000"))
 
 l1000_line_data <- l1000_counts %>%
   split(.$comparison) %>%
@@ -50,7 +50,7 @@ l1000_line_data <- l1000_counts %>%
     function (df) {
       df %>%
         mutate(gene_id = fct_reorder(gene_id, count, .fun = median)) %>%
-        group_by(gene_id, in_l1000) %>%
+        group_by(gene_id, l1000) %>%
         summarize(quant = list(quantile(count, probs = c(0, .25, .5, .75, 1)))) %>%
         mutate(quant = map(quant, enframe, name = "quantile", value = "count")) %>%
         unnest(quant)
@@ -61,40 +61,34 @@ l1000_line_plot <- l1000_line_data %>%
   map(
     ~ggplot(., aes(as.integer(gene_id), count + .1)) +
       geom_line(aes(color = quantile, group = quantile)) +
-      facet_wrap(~in_l1000) +
-      scale_y_log10()
-  )
-
-l1000_line_plot2 <- l1000_line_data %>%
-  map(
-    ~ggplot(.x %>% filter(quantile == "50%"), aes(as.integer(gene_id), count + .1)) +
-      geom_line(aes(color = in_l1000, group = in_l1000)) +
+      facet_wrap(~l1000) +
       scale_y_log10()
   )
 
 detectable_threshold <- 5
 fraction_detectable <- l1000_counts %>%
   mutate(detectable = count >= detectable_threshold) %>%
-  group_by(comparison, sample_id, in_l1000) %>%
+  group_by(comparison, sample_id, l1000) %>%
   summarize(n_detectable = sum(detectable), fraction_detectable = n_detectable/n())
 
 fraction_detectable_plot <- fraction_detectable %>%
-  ggplot(aes(comparison, fraction_detectable, fill = in_l1000)) +
-    geom_violin(draw_quantiles = c(.25, .5, .75))
+  ggplot(aes(comparison, fraction_detectable, fill = l1000)) +
+    geom_violin(draw_quantiles = c(.25, .5, .75)) +
+    ggtitle("Fraction of genes ≥5")
 ggsave(file.path("cmap_overlap", "fraction_detectable.pdf"), fraction_detectable_plot, width = 5, height = 5)
 
 fraction_detectable_per_gene <- l1000_counts %>%
   mutate(detectable = count >= detectable_threshold) %>%
   group_by(comparison, gene_id) %>%
-  summarize(fraction_detectable = sum(detectable)/n(), in_l1000 = in_l1000[1]) %>%
+  summarize(fraction_detectable = sum(detectable)/n(), l1000 = l1000[1]) %>%
   spread(comparison, fraction_detectable)
 
 fraction_detectable_per_gene_plot <- fraction_detectable_per_gene %>%
-  ggplot(aes(bulk, dge, color = in_l1000)) +
+  ggplot(aes(bulk, dge, color = l1000)) +
     geom_point()
 
 fraction_detectable_per_gene_plot_hex <- fraction_detectable_per_gene %>%
-  split(.$in_l1000) %>%
+  split(.$l1000) %>%
   imap(
     ~ggplot(.x, aes(bulk, dge)) +
       geom_hex() +
@@ -104,15 +98,19 @@ fraction_detectable_per_gene_plot_hex <- fraction_detectable_per_gene %>%
   wrap_plots(ncol = 1)
 
 fraction_detectable_per_gene_plot_density_scatter <- fraction_detectable_per_gene %>%
-  mutate(in_l1000 = recode(as.character(in_l1000), "TRUE" = "l1000", "FALSE" = "not_l1000")) %>%
-  split(.$in_l1000) %>%
+  split(.$l1000) %>%
   map(mutate, density = as.numeric(densCols(bulk, dge, colramp = function(n) seq(from = 0, to = n, length.out = n)))) %>%
   imap(
     ~ggplot(.x, aes(bulk, dge, color = density)) +
       geom_point() +
-      ggtitle(.y) +
       coord_fixed() +
-      lims(x = c(0, 1), y = c(0, 1))
+      lims(x = c(0, 1), y = c(0, 1)) +
+      labs(
+        x = "RNA-seq (fraction of samples\nwith expression >5)",
+        y = "DGE (fraction of samples\nwith expression >5)",
+        title = .y,
+        color = "Number of\ngenes"
+      )
   ) %>%
   wrap_plots(ncol = 1)
 ggsave(file.path("cmap_overlap", "fraction_detectable_per_gene_density_scatter.pdf"), fraction_detectable_per_gene_plot_density_scatter, width = 4, height = 8)
