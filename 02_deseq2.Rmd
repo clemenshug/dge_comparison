@@ -1,0 +1,569 @@
+---
+title: "DESeq2 differential expression"
+author: "Clemens Hug"
+date: "2/5/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(VennDiagram)
+library(UpSetR)
+
+paste_ <- function(...) {
+  paste(..., sep = "_")
+}
+```
+
+Comparing the differentially expressed genes between Bulk RNA-seq and DGE with
+different strategies.
+
+Using MCF7 cells treated with Abemaciclib as example condition, since it is the
+only condition where the entire hypercube of cell line, drug, concentration and
+time is present in both DGE and bulk with at least 2 replicates.
+
+```{r loading}
+cdk_meta_combined <- readr::read_csv(file.path("wrangled", "cdk_meta_combined.csv"))
+cdk_count_combined <- readr::read_csv(file.path("wrangled", "cdk_count_combined.csv.gz"))
+cdk_meta_matched_samples <- readr::read_rds(file.path("wrangled", "cdk_meta_matched_samples.rds"))
+
+ensembl_gene_id_mapping <- readr::read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv"))
+
+sample_subsets_list <- readr::read_rds(file.path("sample_matching", "sample_subsets_list.rds"))
+
+mcf7_abemaciclib_sample_ids <- sample_subsets_list[["mcf7_abemaciclib"]]
+
+cdk_meta_deseq <- cdk_meta_combined %>%
+  # Generate unique id for each combination of exp parameters
+  dplyr::mutate(condition = paste_(method, cell_line, drug, concentration, time)) %>%
+  as.data.frame() %>%
+  `rownames<-`(.$sample_id)
+
+cdk_count_deseq <- cdk_count_combined %>%
+  dplyr::select(-method, -symbol) %>%
+  tidyr::spread(sample_id, count) %>%
+  as.data.frame() %>%
+  `rownames<-`(.$ensembl_gene_id) %>%
+  dplyr::select(-ensembl_gene_id)
+
+```
+
+
+First, calling effect of drug treatment on bulk and DGE separately and comparing
+log2Fold changes and sets of differentially regulated genes.
+
+Trying three design matrices:
+
+1. Modelling drug concentration as linear term, using concentration directly
+2. As 1., but log transforming concentration, shifting 0 concentration to 1 before
+transformation
+3. Separate term for each concentration, testing effect of drug at *any* concentration
+using the LRT test on a reduced model without the drug terms
+
+
+```{r de_separate}
+meta_deseq_separate <- cdk_meta_deseq %>%
+  dplyr::filter(sample_id %in% mcf7_abemaciclib_sample_ids) %>%
+  dplyr::arrange(method, concentration) %>%
+  # tidyr::nest(-method)
+  split(.$method)
+
+cdk_count_deseq_separate <- meta_deseq_separate %>%
+  purrr::map(
+    ~cdk_count_deseq[, .x$sample_id]
+  )
+
+designs_separate <- list(
+  "conc_linear" = list(
+    "model_func" = function (m) {
+      model.matrix(
+        ~concentration,
+        data = m
+      )
+    },
+    "meta_func" = identity,
+    "test_func" = function (d) DESeq2::DESeq(d)
+  ),
+  "conc_log" = list(
+    "model_func" = function (m) {
+      model.matrix(
+        ~concentration,
+        data = m
+      )
+    },
+    "meta_func" = . %>% dplyr::mutate(concentration = log10(concentration + 1)),
+    "test_func" = function (d) DESeq2::DESeq(d)
+  ),
+  "conc_factor" = list(
+    "model_func" = function (m) {
+      model.matrix(
+        ~concentration,
+        data = m
+      )
+    },
+    "meta_func" = function (m) {
+      dplyr::mutate(
+        m,
+        concentration = factor(concentration, levels = sort(unique(concentration)))
+      )
+    },
+    "test_func" = function (d) {
+      reduced_matrix <- model.matrix(
+        ~ 1,
+        data = SummarizedExperiment::colData(d) %>%
+          as.data.frame() %>%
+          dplyr::mutate(
+            concentration = factor(concentration, levels = sort(unique(concentration)))
+          )
+      )
+      DESeq2::DESeq(d, test = "LRT", reduced = reduced_matrix)
+    }
+  )
+) %>%
+  purrr::map(
+    function(l) {
+      tibble::as_tibble(purrr::map(l, list))
+    }
+  ) %>%
+  dplyr::bind_rows(.id = "design")
+
+deseq_params_separate <- meta_deseq_separate %>%
+  # Generating model matrix for each design
+  purrr::map(
+    function (m) {
+      designs_separate %>%
+        dplyr::mutate(
+          meta = purrr::map(
+            meta_func,
+            ~.x(m)
+          ),
+          meta_orig = list(m),
+          model_matrix = purrr::map2(
+            model_func, meta,
+            ~.x(.y)
+          )
+        )
+    }
+  ) %>%
+  dplyr::bind_rows(.id = "method")
+
+deseq_separate <- deseq_params_separate %>%
+  # dplyr::filter(design == "conc_factor") %>%
+  dplyr::mutate(
+    des = purrr::pmap(
+      .,
+      function (method, model_matrix, test_func, design, meta, ...) {
+        message("\nProcessing ", design)
+        DESeq2::DESeqDataSetFromMatrix(
+          cdk_count_deseq_separate[[method]],
+          meta,
+          design = model_matrix
+        ) %>%
+          test_func()
+      }
+    )
+  )
+readr::write_rds(deseq_separate, file.path("deseq", "deseq_datasets_mcf7_abemaciclib_separate.rds"))
+
+deseq_separate_res <- deseq_separate %>%
+  dplyr::mutate(
+    res = purrr::map(
+      des,
+      ~ DESeq2::results(.x) %>%
+        as.data.frame() %>%
+        dplyr::mutate(ensembl_gene_id = row.names(.x))
+    )
+  )
+
+
+
+upset_separate_sign_ids <- deseq_separate_res %>%
+  dplyr::mutate(
+    up_ids = purrr::map(
+      res,
+      ~.x %>%
+        dplyr::filter(padj < .05, log2FoldChange > 0) %>%
+        .$ensembl_gene_id
+    ),
+    down_ids = purrr::map(
+      res,
+      ~.x %>%
+        dplyr::filter(padj < .05, log2FoldChange < 0) %>%
+        .$ensembl_gene_id
+    )
+  )
+
+withr::with_pdf(
+  file.path("deseq", "upset_separate_up_genes.pdf"),
+  UpSetR::upset(
+    UpSetR::fromList(
+      purrr::set_names(upset_separate_sign_ids$up_ids, paste_(upset_separate_sign_ids$design, upset_separate_sign_ids$method))
+    ),
+    nsets = 6,
+    order.by = "freq"
+  )
+)
+
+withr::with_pdf(
+  file.path("deseq", "upset_separate_down_genes.pdf"),
+  UpSetR::upset(
+    UpSetR::fromList(
+      purrr::set_names(upset_separate_sign_ids$down_ids, paste_(upset_separate_sign_ids$design, upset_separate_sign_ids$method))
+    ),
+    nsets = 6,
+    order.by = "freq"
+  )
+)
+
+dir.create(file.path("deseq", "venn_diagrams"))
+sign_genes_separate <- deseq_separate_res %>%
+  dplyr::select(method, design, res) %>%
+  tidyr::unnest(res) %>%
+  dplyr::group_by(method, design) %>%
+  dplyr::summarize(
+    up = list(
+      ensembl_gene_id[ifelse(is.finite(padj), padj < .05 & log2FoldChange > 0, FALSE)]
+    ),
+    down = list(
+      ensembl_gene_id[ifelse(is.finite(padj), padj < .05 & log2FoldChange < 0, FALSE)]
+    )
+  )
+
+venn_separate_per_design <- sign_genes_separate %>%
+  split(.$design) %>%
+  purrr::map(
+    function (df) {
+      list(
+        up_plot = VennDiagram::venn.diagram(set_names(df$up, df$method), filename = NULL, main = paste_(df$design, "up")),
+        down_plot = VennDiagram::venn.diagram(set_names(df$down, df$method), filename = NULL, main = paste_(df$design, "down"))
+      )
+    }
+  )
+
+purrr::iwalk(
+  venn_separate_per_design,
+  function (l, design) {
+    ggsave(
+      file.path("deseq", "venn_diagrams", paste_("venn_separate", design, "up.pdf")),
+      l$up_plot
+    )
+    ggsave(
+      file.path("deseq", "venn_diagrams", paste_("venn_separate", design, "down.pdf")),
+      l$down_plot
+    )
+  }
+)
+venn_separate_per_design_combined <- venn_separate_per_design %>%
+  purrr::flatten() %>%
+  purrr::map(grobTree) %>%
+  gridExtra::grid.arrange(grobs = ., ncol = 3, as.table = FALSE)
+ggsave(file.path("deseq", "venn_diagrams", "venn_separate_per_design_all_combined.pdf"), venn_separate_per_design_combined,
+       width = 7, height = 5)
+
+venn_separate_per_method <- sign_genes_separate %>%
+  split(.$method) %>%
+  purrr::map(
+    function (df) {
+      list(
+        up_plot = VennDiagram::venn.diagram(set_names(df$up, df$design), filename = NULL, main = paste_(df$method, "up"), margin = .2),
+        down_plot = VennDiagram::venn.diagram(set_names(df$down, df$design), filename = NULL, main = paste_(df$method, "down"), margin = .2)
+      )
+    }
+  )
+venn_separate_per_method_combined <- venn_separate_per_method %>%
+  purrr::flatten() %>%
+  purrr::map(grobTree) %>%
+  gridExtra::grid.arrange(grobs = ., ncol = 3, as.table = FALSE)
+ggsave(file.path("deseq", "venn_diagrams", "venn_separate_per_method_all_combined.pdf"), venn_separate_per_method_combined,
+       width = 7, height = 5)
+
+model_matrix_table_plots <- deseq_params_separate %>%
+  dplyr::mutate(
+    table_plot = purrr::pmap(
+      .,
+      function (meta_orig, model_matrix, ...) {
+        # browser()
+        dplyr::select(meta_orig, method, cell_line, drug, conc = concentration) %>%
+          dplyr::bind_cols(as.data.frame(model_matrix)) %>%
+          gridExtra::tableGrob()
+      }
+    )
+  )
+dir.create(file.path("deseq", "model_matrices"), showWarnings = FALSE)
+purrr::pwalk(
+  model_matrix_table_plots,
+  function (table_plot, design, method, ...) {
+    ggsave(
+      file.path("deseq", "model_matrices", paste_("matrix", method, design, ".pdf")),
+      table_plot,
+      width = 10
+    )
+  }
+)
+
+residuals_separate <- deseq_separate %>%
+  dplyr::mutate(
+    residuals = purrr::map(
+      des,
+      function (de) {
+        {SummarizedExperiment::assay(de, "mu") - DESeq2::counts(de, normalized = FALSE)} %>%
+          tibble::as_tibble() %>%
+          dplyr::mutate(ensembl_gene_id = row.names(de)) %>%
+          tidyr::gather("sample_id", "residual", -ensembl_gene_id)
+      }
+    )
+  ) %>%
+  dplyr::select(method, design, residuals) %>%
+  tidyr::unnest(residuals)
+
+# https://support.bioconductor.org/p/117448/#117465
+deviance_separate <- deseq_separate %>%
+  dplyr::mutate(
+    deviance = purrr::map(
+      des,
+      function (de) {
+        c <- DESeq2::counts(de)
+        d <- DESeq2::dispersions(de)
+        tibble::tibble(
+          deviance = mcols(de)[["deviance"]] - 2*rowSums(dnbinom(c, mu = c, size = 1/d, log = TRUE)),
+          ensembl_gene_id = row.names(de)
+        )
+      }
+    )
+  ) %>%
+  dplyr::select(method, design, deviance) %>%
+  tidyr::unnest(deviance)
+
+deviance_sum_separate <- deviance_separate %>%
+  dplyr::filter(is.finite(deviance)) %>%
+  dplyr::group_by(method, design) %>%
+  dplyr::summarize(sum_deviance = sum(deviance), sum_squares_deviance = sum(deviance**2))
+
+ggsave(
+  file.path("deseq", "deviance_separate_table.pdf"),
+  gridExtra::tableGrob(deviance_sum_separate)
+)
+
+residuals_sum_separate <- residuals_separate %>%
+  dplyr::filter(is.finite(residual)) %>%
+  dplyr::group_by(method, design) %>%
+  dplyr::summarise(sum_residuals = sum(residual), sum_squares_residuals = sum(residual**2))
+
+ggsave(
+  file.path("deseq", "residuals_separate_table.pdf"),
+  gridExtra::tableGrob(residuals_sum_separate)
+)
+
+```
+
+Another alternative is to compare the two methods by explicitely incorporating them
+in the DESeq2 model design.
+
+Log concentration model performed well, using this as baseline. In addition
+
+1. Using method term DGE vs bulk
+2. Like 1., and an interaction term between method and concentration
+
+```{r de_together}
+meta_deseq_together <- list(
+  together = cdk_meta_deseq %>%
+    dplyr::filter(sample_id %in% mcf7_abemaciclib_sample_ids) %>%
+    dplyr::arrange(method, concentration)
+)
+
+cdk_count_deseq_together <- list(
+  together = cdk_count_deseq[, meta_deseq_together$together$sample_id]
+)
+
+designs_together <- list(
+  "conc_log" = list(
+    "model_func" = function (m) {
+      model.matrix(
+        ~concentration + method,
+        data = m
+      )
+    },
+    "meta_func" = . %>% dplyr::mutate(concentration = log10(concentration + 1)),
+    "test_func" = function (d) DESeq2::DESeq(d)
+  ),
+  "conc_log_interaction" = list(
+    "model_func" = function (m) {
+      model.matrix(
+        ~concentration + method + concentration:method,
+        data = m
+      )
+    },
+    "meta_func" = . %>% dplyr::mutate(concentration = log10(concentration + 1)),
+    "test_func" = function (d) DESeq2::DESeq(d)
+  )
+) %>%
+  purrr::map(
+    function(l) {
+      tibble::as_tibble(purrr::map(l, list))
+    }
+  ) %>%
+  dplyr::bind_rows(.id = "design")
+
+
+deseq_params_together <- meta_deseq_together %>%
+  # Generating model matrix for each design
+  purrr::map(
+    function (m) {
+      designs_together %>%
+        dplyr::mutate(
+          meta = purrr::map(
+            meta_func,
+            ~.x(m)
+          ),
+          meta_orig = list(m),
+          model_matrix = purrr::map2(
+            model_func, meta,
+            ~.x(.y)
+          )
+        )
+    }
+  ) %>%
+  dplyr::bind_rows(.id = "method")
+
+deseq_together <- deseq_params_together %>%
+  # dplyr::filter(design == "conc_factor") %>%
+  dplyr::mutate(
+    des = purrr::pmap(
+      .,
+      function (method, model_matrix, test_func, design, meta, ...) {
+        message("\nProcessing ", design)
+        DESeq2::DESeqDataSetFromMatrix(
+          cdk_count_deseq_together[[method]],
+          meta,
+          design = model_matrix
+        ) %>%
+          test_func()
+      }
+    )
+  )
+
+deseq_together_res <- deseq_together %>%
+  dplyr::mutate(
+    res = purrr::map(
+      des,
+      function (de) {
+        purrr::map(
+          DESeq2::resultsNames(de)[-1],
+          ~DESeq2::results(de, name = .x) %>%
+            as.data.frame() %>%
+            dplyr::mutate(ensembl_gene_id = row.names(de), coef = .x)
+        ) %>%
+          dplyr::bind_rows()
+      }
+    )
+  )
+
+ma_plots_together <- deseq_together_res %>%
+  dplyr::mutate(
+    ma_plot = purrr::map(
+      res,
+      function (r) {
+        r %>%
+          dplyr::arrange(desc(padj)) %>%
+          ggplot(aes(baseMean, log2FoldChange, color = (padj < .05))) +
+            geom_point() +
+            scale_x_log10() +
+            facet_wrap(~coef, scales = "free_y", ncol = 1)
+      }
+    )
+  )
+dir.create(file.path("deseq", "ma_plots"), showWarnings = FALSE)
+purrr::pwalk(
+  ma_plots_together,
+  function (method, design, ma_plot, ...) {
+    ggsave(
+      file.path("deseq", "ma_plots", paste_("ma", method, design, ".pdf")),
+      ma_plot
+    )
+  }
+)
+
+```
+
+
+```{r pca_together}
+pca_plot <- function (data, meta, aes = ggplot2::aes(PC1, PC2), extra_layers = NULL, ...) {
+  p <- prcomp(data, ...)
+  pstats <- t(summary(p)$importance) %>%
+    tibble::as_tibble(rownames = "component") %>%
+    dplyr::rename(sdev = `Standard deviation`, prop_var = `Proportion of Variance`, cum_prop = `Cumulative Proportion`) %>%
+    dplyr::mutate(component = factor(component, levels = unique(component))) %>%
+    # Remove all components after cumsum reaches .999
+    dplyr::filter(cumsum(dplyr::lag(cum_prop > .95, default = FALSE)) <= 1)
+  ploadings <- p$x %>%
+    tibble::as_tibble() %>%
+    dplyr::bind_cols(meta)
+  p_plot <- ggplot(ploadings, aes) +
+    geom_point()
+  if (!is.null(extra_layers))
+    p_plot <- p_plot + extra_layers
+  # var_plot <- ggplot(pstats, ggplot2::aes(x = 1, y = prop_var, fill = component)) +
+  #   geom_col(position = "stack") +
+  #   # geom_text(ggplot2::aes(y = cum_prop, label = prop_var), halign = 0, valign = 1) +
+  #   coord_flip() +
+  #   guides(fill = FALSE)
+    # theme(legend.position = "bottom")
+  # browser()
+  var_table <- gridExtra::tableGrob(
+    pstats %>%
+      dplyr::select(component, prop_var) %>%
+      dplyr::mutate(prop_var = formatC(prop_var * 100, digits = 3, format = "fg")) %>%
+      tidyr::spread(component, prop_var),
+    rows = NULL,
+    theme = gridExtra::ttheme_default(base_size = 6)
+  )
+  patchwork::wrap_plots(p_plot, var_table, heights = c(5, 1), ncol = 1)
+}
+
+mcf7_pca_plot <- pca_plot(
+  DESeq2::varianceStabilizingTransformation(deseq_together$des[[1]]) %>%
+    SummarizedExperiment::assay() %>%
+    t(),
+  meta_deseq_together$together %>%
+    `rownames<-`(.$sample_id),
+  aes(PC1, PC2, shape = method, color = concentration),
+  extra_layers = list(
+    scale_color_continuous(trans = "log10"),
+    labs(title = "MCF7 Abemaciclib")
+  )
+)
+ggsave(
+  file.path("deseq", "mcf7_pca_plot.pdf"),
+  mcf7_pca_plot,
+  height = 6,
+  width = 5
+)
+
+model_matrix_table_plots_together <- deseq_params_together %>%
+  dplyr::mutate(
+    table_plot = purrr::pmap(
+      .,
+      function (meta_orig, model_matrix, ...) {
+        # browser()
+        dplyr::select(meta_orig, method, cell_line, drug, conc = concentration) %>%
+          dplyr::bind_cols(as.data.frame(model_matrix)) %>%
+          gridExtra::tableGrob()
+      }
+    )
+  )
+dir.create(file.path("deseq", "model_matrices"), showWarnings = FALSE)
+purrr::pwalk(
+  model_matrix_table_plots_together,
+  function (table_plot, design, method, ...) {
+    ggsave(
+      file.path("deseq", "model_matrices", paste_("together_matrix", method, design, ".pdf")),
+      table_plot,
+      width = 10
+    )
+  }
+)
+
+
+
+```

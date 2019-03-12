@@ -1,0 +1,38 @@
+---
+title: "Effect of dispersion parameter on negative binomial distribution"
+output: html_notebook
+---
+
+
+```{r loading}
+library(tidyverse)
+```
+
+```{r nb_density_plot}
+
+plot(dnbinom(0:20, size = 1/.28, mu = 10))
+
+nb_example_data <- expand.grid(
+  dispersion = 10**seq(-2, 0, length.out = 4),
+  mu = c(10, 20, 50)
+) %>%
+  dplyr::mutate(
+    values = purrr::map2(
+      dispersion, mu,
+      ~tibble::tibble(
+        density = dnbinom(0:100, size = 1/.x, mu = .y),
+        value = 0:100
+      )
+    )
+  ) %>%
+  tidyr::unnest(values)
+
+nb_example_plot <- nb_example_data %>%
+  dplyr::mutate(dispersion = factor(dispersion, levels = sort(unique(dispersion)))) %>%
+  ggplot(aes(value, density, color = dispersion, group = dispersion)) +
+    geom_step() +
+    facet_wrap(~mu, ncol = 1) +
+    labs(x = expression("k"), y = expression("Pr(X = k)"))
+dir.create("example", showWarnings = FALSE)
+ggsave(file.path("example", "binomial_distribution_density.pdf"), nb_example_plot)
+```

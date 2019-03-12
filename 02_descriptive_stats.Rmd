@@ -1,0 +1,67 @@
+
+```{r loading}
+# library(synExtra)
+library(tidyverse)
+library(patchwork)
+
+# synapser::synLogin()
+# syn <- synExtra::synDownloader("~/data/DGE_comp/")
+# syn_csv <- function(synid, ...) {
+#   syn(synid) %>%
+#     readr::read_csv(...)
+# }
+# syn_tsv <- function(synid, ...) {
+#   syn(synid) %>%
+#     readr::read_tsv(...)
+# }
+paste_ <- function(...) {
+  paste(..., sep = "_")
+}
+
+theme_set(theme_light())
+```
+
+
+```{r datasets}
+
+deseq <- readr::read_rds(file.path("deseq", "deseq_datasets.rds"))
+counts <- readr::read_csv(file.path("deseq", "count_data.csv.gz"))
+
+ensembl_gene_id_mapping <- readr::read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv")) 
+
+l1000 <- readr::read_csv(file.path("wrangled", "l1000_gene_list.csv"))
+l1000_ensembl_gene_ids <- l1000 %>%
+  dplyr::left_join(ensembl_gene_id_mapping, by = c("gene_symbol" = "symbol")) %>%
+  tidyr::drop_na(ensembl_gene_id) %>%
+  .$ensembl_gene_id
+
+```
+
+
+```{r sequencing_depth}
+seq_depth <- counts %>%
+  filter(comparison %in% c("dge", "bulk"), normalization == "raw") %>%
+  group_by(comparison, sample_id) %>%
+  summarize(depth = sum(count)) %>%
+  ungroup()
+```
+
+
+```{r sequencin_depth_plots}
+seq_depth_violin <- seq_depth %>%
+  # Get rid out outlier bulk which has < 1000 counts
+  filter(depth > 1000) %>%
+  ggplot(aes(comparison, depth)) +
+    geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+    scale_y_log10() +
+    geom_label(
+      aes(comparison, ypos, label = median),
+      data = . %>%
+        group_by(comparison) %>%
+        summarize(median = format(median(depth), big.mark = ",", scientific = FALSE), ypos = median(depth)),
+      label.size = 0
+    )
+dir.create("descriptive_stats", showWarnings = FALSE)
+ggsave(file.path("descriptive_stats", "sequencing_depth_violin.pdf"), width = 4.5, height = 4.5)
+```
+

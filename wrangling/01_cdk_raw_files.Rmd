@@ -1,0 +1,141 @@
+---
+title: "CDK raw files"
+author: "Clemens Hug"
+date: "2/23/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+```
+
+## Locate raw CDK4/6 files on o2
+
+Files are located on `/n/files/ImStor` mount, have to use the transfer node to
+access them.
+
+Mount the file system using `sshfs` tool.
+
+```{bash mount_imstor}
+mkdir -p ImStor
+sshfs ch305@transfer.rc.hms.harvard.edu:/n/files/ImStor ImStor
+```
+
+Fetch list of fastq files.
+
+```{r fast_files}
+fastqs_list <- list(
+  "201608" = list.files(
+    file.path(
+      "ImStor/sorger/data/rnaseq/lincs/rnaseq/CDK46_response_201608/fastq",
+      c("160824_CM3415-1_NS500233_fastq", "160825_CM3415-2_NS500144_fastq")
+    ),
+    pattern = ".+\\.fastq\\.gz",
+    full.names = TRUE
+  ),
+  "201701" = list.files(
+    "ImStor/sorger/data/rnaseq/lincs/rnaseq/CDK46_response_201701/fastq",
+    pattern = ".+\\.fastq\\.gz",
+    full.names = TRUE
+  )
+) %>%
+  map(~paste("/n/files", .x, sep = "/"))
+```
+
+
+```{r metadata}
+metadata_list <- list(
+  "201608" = read_csv("ImStor/sorger/data/rnaseq/lincs/rnaseq/CDK46_response_201608/CDK46_response_201608_metadata.csv"),
+  "201701" = read_csv("ImStor/sorger/data/rnaseq/lincs/rnaseq/CDK46_response_201701/CDK46_response_201701_metadata.csv")
+)
+
+```
+
+```{bash unmount_imstor}
+diskutil unmount ImStor
+rmdir ImStor
+```
+
+
+```{r combine_data}
+fastqs <- fastqs_list %>%
+  map(enframe, value = "fastq") %>%
+  bind_rows(.id = "run")
+
+metadata <- list(
+  "201608" = metadata_list[["201608"]] %>%
+    rename(well = Well, cell_line = `cell line`, concentration = dose,
+           library_prep_date = `Library prep`, rna_concentration = `RNA ng/ul`) %>%
+    mutate(sample_id = well) %>%
+    drop_na(sample_id),
+  "201701" = metadata_list[["201701"]] %>%
+    rename(well = Position, sample_id = Sample, time = `Time point`, harvest = Harvest,
+           library_prep_date = `Library prep date`, rna_concentration = `RNA (ng/ul)`) %>%
+    # Remove samples unrelated to CDK4/6 experiment
+    filter(sample_id < 25) %>%
+    separate(Treatment, c("concentration", "drug"), sep = " ", fill = "left", extra = "merge") %>%
+    mutate(
+      time = str_replace(time, " hours", "h"),
+      concentration = as.numeric(replace_na(concentration, 0)),
+      # According to Kartik all samples in this experiment (201701) are MCF7
+      cell_line = "MCF7"
+    ) %>%
+    mutate_at(vars(well, sample_id), as.character)
+) %>%
+  bind_rows(.id = "run") %>%
+  mutate(
+    drug = recode(
+      drug, Palbo = "palbociclib", Abema = "abemaciclib", Ribo = "ribociclib",
+      ctrl = "dmso"
+    )
+  )
+
+metadata_fastq <- fastqs %>%
+  mutate(
+    sample_id = str_match(basename(fastq), "^[^_]+_([^_]+)_.+")[,2]
+  ) %>%
+  left_join(metadata, by = c("run", "sample_id")) %>%
+  # Remove samples unrelated to CDK4/6 experiment
+  drop_na(drug)
+write_csv(metadata_fastq, file.path("..", "wrangled", "cdk_fastq.csv"))
+```
+
+## ERCC spike-in
+
+The bulk RNA-seq samples where run with ERCC spike in, adding the fasta files
+for alignment from https://assets.thermofisher.com/TFS-Assets/LSG/manuals/ERCC92.zip
+
+Move to 
+
+```{r ercc}
+download.file(
+  "https://assets.thermofisher.com/TFS-Assets/LSG/manuals/ERCC92.zip",
+  file.path("..", "wrangled", "ercc_fasta.zip")
+)
+```
+
+```{bash unpack_ercc}
+unzip -o -d ../wrangled ../wrangled/ercc_fasta.zip
+ssh ch305@o2.hms.harvard.edu 'mkdir -p /home/ch305/annotation/ercc/'
+scp ../wrangled/ERCC92.fa ch305@o2.hms.harvard.edu:/home/ch305/annotation/ercc/
+```
+
+## Bulk metadata for bcbio
+
+Format cdk data for alignment with Bcbio using the o2jobber utility (on github
+at https://github.com/clemenshug/o2jobber )
+
+
+```{r metadata_alignment}
+metadata_alignment <- metadata_fastq %>%
+  mutate(
+    id = paste(run, sample_id, drug, concentration, sep = "_"),
+    fastq = paste0("transfer.rc.hms.harvard.edu:", fastq),
+    transcriptome_fasta = "/home/ch305/annotation/hsap/GRCh38.95/Homo_sapiens.GRCh38.combined.fa",
+    transcriptome_gtf = "/home/ch305/annotation/hsap/GRCh38.95/Homo_sapiens.GRCh38.95.gtf",
+    spikein_fasta = "/home/ch305/annotation/ercc/ERCC92.fa"
+  )
+write_csv(metadata_alignment, file.path("..", "wrangled", "cdk_bulk_alignment_metadata.csv"))
+```
+
+Followed by using o2jobber to start alignment job with bcbio on O2.

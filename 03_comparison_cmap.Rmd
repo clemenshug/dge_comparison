@@ -1,0 +1,154 @@
+---
+title: "Comparison Connectivity Map"
+author: "Clemens Hug"
+date: "2/6/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(VennDiagram)
+library(UpSetR)
+library(cmapR)
+library(patchwork)
+
+paste_ <- function(...) {
+  paste(..., sep = "_")
+}
+```
+
+
+```{r loading}
+cdk_meta_combined <- readr::read_csv(file.path("wrangled", "cdk_meta_combined.csv"))
+
+ensembl_gene_id_mapping <- readr::read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv"))
+
+sample_subsets_list <- readr::read_rds(file.path("sample_matching", "sample_subsets_list.rds"))
+
+deseq <- readr::read_rds(file.path("deseq", "deseq_datasets.rds"))
+counts <- readr::read_csv(file.path("deseq", "count_data.csv.gz"))
+
+ensembl_gene_id_mapping <- readr::read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv")) 
+
+l1000 <- readr::read_csv(file.path("wrangled", "l1000_gene_list.csv"))
+l1000_ensembl_gene_ids <- l1000 %>%
+  dplyr::left_join(ensembl_gene_id_mapping, by = c("gene_symbol" = "symbol")) %>%
+  tidyr::drop_na(ensembl_gene_id) %>%
+  .$ensembl_gene_id
+```
+
+
+```{r detected_l1000_genes}
+l1000_counts <- counts %>%
+  filter(comparison %in% c("dge", "bulk"), normalization == "raw") %>%
+  mutate(in_l1000 = gene_id %in% l1000_ensembl_gene_ids)
+
+l1000_line_data <- l1000_counts %>%
+  split(.$comparison) %>%
+  map(
+    function (df) {
+      df %>%
+        mutate(gene_id = fct_reorder(gene_id, count, .fun = median)) %>%
+        group_by(gene_id, in_l1000) %>%
+        summarize(quant = list(quantile(count, probs = c(0, .25, .5, .75, 1)))) %>%
+        mutate(quant = map(quant, enframe, name = "quantile", value = "count")) %>%
+        unnest(quant)
+    }
+  )
+
+l1000_line_plot <- l1000_line_data %>%
+  map(
+    ~ggplot(., aes(as.integer(gene_id), count + .1)) +
+      geom_line(aes(color = quantile, group = quantile)) +
+      facet_wrap(~in_l1000) +
+      scale_y_log10()
+  )
+
+l1000_line_plot2 <- l1000_line_data %>%
+  map(
+    ~ggplot(.x %>% filter(quantile == "50%"), aes(as.integer(gene_id), count + .1)) +
+      geom_line(aes(color = in_l1000, group = in_l1000)) +
+      scale_y_log10()
+  )
+
+detectable_threshold <- 5
+fraction_detectable <- l1000_counts %>%
+  mutate(detectable = count >= detectable_threshold) %>%
+  group_by(comparison, sample_id, in_l1000) %>%
+  summarize(n_detectable = sum(detectable), fraction_detectable = n_detectable/n())
+
+fraction_detectable_plot <- fraction_detectable %>%
+  ggplot(aes(comparison, fraction_detectable, fill = in_l1000)) +
+    geom_violin(draw_quantiles = c(.25, .5, .75))
+ggsave(file.path("cmap_overlap", "fraction_detectable.pdf"), fraction_detectable_plot, width = 5, height = 5)
+
+fraction_detectable_per_gene <- l1000_counts %>%
+  mutate(detectable = count >= detectable_threshold) %>%
+  group_by(comparison, gene_id) %>%
+  summarize(fraction_detectable = sum(detectable)/n(), in_l1000 = in_l1000[1]) %>%
+  spread(comparison, fraction_detectable)
+
+fraction_detectable_per_gene_plot <- fraction_detectable_per_gene %>%
+  ggplot(aes(bulk, dge, color = in_l1000)) +
+    geom_point()
+
+fraction_detectable_per_gene_plot_hex <- fraction_detectable_per_gene %>%
+  split(.$in_l1000) %>%
+  imap(
+    ~ggplot(.x, aes(bulk, dge)) +
+      geom_hex() +
+      ggtitle(.y) +
+      coord_fixed()
+  ) %>%
+  wrap_plots(ncol = 1)
+
+fraction_detectable_per_gene_plot_density_scatter <- fraction_detectable_per_gene %>%
+  mutate(in_l1000 = recode(as.character(in_l1000), "TRUE" = "l1000", "FALSE" = "not_l1000")) %>%
+  split(.$in_l1000) %>%
+  map(mutate, density = as.numeric(densCols(bulk, dge, colramp = function(n) seq(from = 0, to = n, length.out = n)))) %>%
+  imap(
+    ~ggplot(.x, aes(bulk, dge, color = density)) +
+      geom_point() +
+      ggtitle(.y) +
+      coord_fixed() +
+      lims(x = c(0, 1), y = c(0, 1))
+  ) %>%
+  wrap_plots(ncol = 1)
+ggsave(file.path("cmap_overlap", "fraction_detectable_per_gene_density_scatter.pdf"), fraction_detectable_per_gene_plot_density_scatter, width = 4, height = 8)
+# Plot dge vs bulk, fraction of detectable plots, 2d histogram, contour map
+```
+
+
+
+CMap data has been dowloaded from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE92742
+
+
+```{r access_cmap_data}
+dir.create("cmap_overlap")
+cmap_path <- "~/data/DGE_comp/GSE92742_Broad_LINCS_Level5_COMPZ.MODZ_n473647x12328.gctx"
+instance_meta <- readr::read_tsv("~/data/DGE_comp/GSE92742_Broad_LINCS_inst_info.txt")
+gene_meta <- readr::read_tsv("~/data/DGE_comp/GSE92742_Broad_LINCS_gene_info.txt")
+
+instance_meta_trans <- instance_meta %>%
+  dplyr::mutate(drug = stringr::str_to_lower(pert_iname), cell_line = stringr::str_to_lower(cell_id))
+
+
+shared_conditions <- cdk_meta_combined %>%
+  dplyr::mutate_at(vars(drug, cell_line), stringr::str_to_lower) %>%
+  dplyr::left_join(instance_meta_trans, by = c("cell_line", "drug", "time" = "pert_time"))
+
+shared_drugs <- shared_conditions %>%
+  dplyr::group_by(cell_line, drug) %>%
+  dplyr::summarize(n_inst = sum(!is.na(inst_id))) %>%
+  dplyr::arrange(desc(n_inst))
+
+ggsave(
+  file.path("cmap_overlap", "shared_conditions_table.pdf"),
+  gridExtra::tableGrob(head(shared_drugs))
+)
+
+
+cmap_meta <- cmapR::read.gctx.meta(cmap_path, dimension = "row")
+
+```

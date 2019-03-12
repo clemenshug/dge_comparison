@@ -1,0 +1,259 @@
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(biomaRt)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("~/data/DGE_comp/")
+syn_csv <- function(synid, ...) {
+  syn(synid) %>%
+    readr::read_csv(...)
+}
+syn_tsv <- function(synid, ...) {
+  syn(synid) %>%
+    readr::read_tsv(...)
+}
+paste_ <- function(...) {
+  paste(..., sep = "_")
+}
+```
+
+## Goal
+
+Load and process RNA-seq counts from the CDK4/6 inhibitor experiment perfomed
+by Caitlin Mills and Kartik Subramanian.
+Table of samples and the location of the raw data at
+https://docs.google.com/spreadsheets/d/1U-Pjl5pIwPpa1hEMU-Xh-RvUNqiW633mPs6Yzj98ULQ/edit?usp=sharing
+
+
+## Preprocessed
+
+The DGE and bulk RNA-seq data was already aligned and preprocessed, loading data from:
+
+CDK4/6 inhibitor dataset collected by Caitlin Mills
+
+* DGE Counts matrix:  syn17022198
+* Drug identities for DGE: syn17022199
+* RNAseq counts matrix (RPKM): syn17022202
+* Drug identities for RNAseq: syn17022201
+
+Bulk counts in folder
+
+* CDK46_response_201608 folder syn10164318
+  + counts syn10164324
+  + meta syn10155361
+* CDK46_response_201701 folder syn10164319
+  + counts syn10155359
+  + meta syn10155362
+
+
+```{r loading_datasets}
+cdk_dge_counts <- syn_csv("syn17022198") %>%
+  dplyr::rename(ensembl_gene_id = X1) %>%
+  dplyr::filter(ensembl_gene_id != "Sum") %>%
+  tidyr::gather(sample_id, count, -ensembl_gene_id)
+
+cdk_dge_meta <- syn_csv("syn17022199") %>%
+  dplyr::rename(sample_id = well, concentration = `concentration__um`) %>%
+  dplyr::mutate(
+    # DGE data is all collected at 6h according to Kartik
+    time = 6,
+    # Adjusting concentration slightly so it matches bulk data
+    concentration = dplyr::recode(concentration, `3.16` = 3)
+  ) %>%
+  dplyr::select(-sample, -source_name)
+
+cdk_bulk_rpkm <- syn_csv("syn17022202") %>%
+  dplyr::rename(ensembl_gene_id = X1) %>%
+  tidyr::gather(sample_id, count, -ensembl_gene_id)
+
+cdk_bulk_rpkm_meta <- syn("syn17022201") %>%
+  readxl::read_excel(range = "A22:H142")
+
+
+cdk_bulk_meta <- list(
+  "201608" = syn_tsv("syn10155361") %>%
+    dplyr::mutate(DrugName = dplyr::recode(DrugName, `-` = "DMSO")) %>%
+    dplyr::rename(sample_id = well, cell_line = CellLine),
+  "201701" = syn_tsv("syn10155362") %>%
+    tidyr::separate(Treatment, into = c("Conc", "DrugName"), sep = " ", fill = "left") %>%
+    dplyr::mutate(
+      Time = as.integer(stringr::str_extract(`Time point`, "[0-9]+")),
+      Conc = tidyr::replace_na(as.numeric(Conc), 0),
+      Sample = as.character(Sample),
+      DrugName = dplyr::recode(DrugName, ctrl = "DMSO")
+    ) %>%
+    dplyr::rename(cell_line = `Cell line`, sample_id = Sample)
+) %>%
+  dplyr::bind_rows(.id = "run") %>%
+  dplyr::mutate(sample_id = paste_(sample_id, run)) %>%
+  # Remove samples which are not part of CDK experiment in that run
+  dplyr::filter(DrugName != "N/A") %>%
+  dplyr::select(-`Time point`, -run) %>%
+  dplyr::rename(drug = DrugName, concentration = Conc, time = Time)
+
+cdk_bulk_counts <- list(
+  "201608" = "syn10164324",
+  "201701" = "syn10155359"
+) %>%
+  purrr::imap(
+    ~syn_tsv(.x) %>%
+      tidyr::gather("sample", "count", -id) %>%
+      dplyr::mutate(
+        sample_fixed = stringr::str_match(sample, "S([0-9]+)")[, 2],
+        sample_id = ifelse(is.na(sample_fixed), paste_(sample, .y), paste_(sample_fixed, .y))
+      )
+  ) %>%
+  dplyr::bind_rows() %>%
+  dplyr::select(-sample_fixed, -sample) %>%
+  # Remove samples which are not part of CDK experimen
+  dplyr::filter(id != "Sum", sample_id %in% cdk_bulk_meta$sample_id) %>%
+  dplyr::rename(ensembl_gene_id = id)
+
+cdk_dge_sample_counts <- cdk_dge_counts %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::summarize(count = sum(count)) %>%
+  dplyr::arrange(count)
+
+cdk_dge_sample_counts_plot <- cdk_dge_sample_counts %>%
+  dplyr::mutate(sample_id = factor(sample_id, levels = unique(sample_id))) %>% 
+  ggplot(aes(sample_id, count)) +
+  geom_col()
+
+cdk_bulk_sample_counts <- cdk_bulk_counts %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::summarize(count = sum(count)) %>%
+  dplyr::arrange(count)
+
+cdk_bulk_sample_counts_plot <- cdk_bulk_sample_counts %>%
+  dplyr::mutate(sample_id = factor(sample_id, levels = unique(sample_id))) %>% 
+  ggplot(aes(sample_id, count)) +
+  geom_col()
+```
+
+## Match IDs from DGE and bulk
+
+For comparison, have to match gene IDs from bulk and DGE experiment
+I think some genes of DGE have been filtered, have to ask Karthik
+
+```{r common_id_mapping}
+cdk_common_ids <- base::intersect(
+  cdk_dge_counts$ensembl_gene_id,
+  cdk_bulk_counts$ensembl_gene_id
+)
+
+hsap <- biomaRt::useMart("ENSEMBL_MART_ENSEMBL", "hsapiens_gene_ensembl")
+
+ensembl_gene_id_mart <- biomaRt::getBM(
+  attributes = c("hgnc_symbol", "ensembl_gene_id"),
+  filters = "ensembl_gene_id",
+  values = union(cdk_dge_counts$ensembl_gene_id, cdk_bulk_counts$ensembl_gene_id),
+  mart = hsap
+) %>%
+  dplyr::rename(symbol = hgnc_symbol)
+
+ensembl_gene_id_mart %>%
+  dplyr::count(ensembl_gene_id) %>%
+  dplyr::count(n)
+# Two ensembl_gene_ids map to multiple HUGO symbols, setting those NA...
+# Also there are some ensembl_gene_ids that are in the biomart DB, but that
+# map to empty "" symbols. Setting those to NA as well.
+ensembl_gene_id_mapping <- ensembl_gene_id_mart %>%
+  dplyr::group_by(ensembl_gene_id) %>%
+  dplyr::summarize(symbol = if (n() > 1) as.character(NA) else symbol) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(symbol = ifelse(symbol == "", as.character(NA), symbol))
+ensembl_gene_id_mapping %>%
+  dplyr::count(ensembl_gene_id) %>%
+  dplyr::count(n)
+# Good now, no duplicates
+
+all(cdk_common_ids %in% ensembl_gene_id_mapping$ensembl_gene_id)
+# TRUE
+# All ensembl IDs are present in the biomart df!
+
+cdk_bulk_counts <- cdk_bulk_counts %>%
+  dplyr::left_join(ensembl_gene_id_mapping, by = "ensembl_gene_id")
+cdk_dge_counts <- cdk_dge_counts %>%
+  dplyr::left_join(ensembl_gene_id_mapping, by = "ensembl_gene_id")
+
+library(VennDiagram)
+
+vd <- VennDiagram::venn.diagram(
+  list(
+    "dge" = unique(cdk_dge_counts$ensembl_gene_id),
+    "bulk" = unique(cdk_bulk_counts$ensembl_gene_id)
+  ),
+  filename = NULL
+)
+dir.create(file.path("..", "overlap"), showWarnings = FALSE)
+ggsave(file.path("..", "overlap", "overlap_ensembl_ids.pdf"), vd)
+```
+
+## Matching conditions
+
+Trying to find a condition where we can directly compare DGE and bulk, so a condition
+where same cell line, concentration and time was used and at least two replicates
+are available.
+
+```{r generate_combined_dge_bulk_datasets}
+cdk_meta_combined <- list(
+  "bulk" = cdk_bulk_meta,
+  "dge" = cdk_dge_meta
+) %>%
+  dplyr::bind_rows(.id = "method") %>%
+  dplyr::mutate(sample_id = paste_(method, sample_id)) %>%
+  dplyr::arrange(sample_id)
+
+matched_samples <- cdk_meta_combined %>%
+  dplyr::group_by(method, cell_line, drug, concentration, time) %>%
+  dplyr::summarize(values = list(list(n = n(), sample_ids = sample_id))) %>%
+  tidyr::spread(method, values) %>%
+  # Overly complicated maybe, but trying to combine all sample_ids from DGE
+  # and bulk for each condition
+  dplyr::mutate(
+    sample_ids = purrr::map2(
+      dge, bulk,
+      ~c(.x[["sample_ids"]], .y[["sample_ids"]])
+    ),
+    dge = purrr::map_int(dge, ~.x[["n"]] %||% 0L),
+    bulk = purrr::map_int(bulk, ~.x[["n"]] %||% 0L)
+  )
+
+matched_samples_table_plot <- gridExtra::tableGrob(
+  matched_samples %>%
+    dplyr::select(-sample_ids) %>%
+    dplyr::arrange(cell_line, drug, concentration) %>%
+    dplyr::filter(dge > 1, bulk > 1) %>%
+    dplyr::rename(n_bulk = bulk, n_dge = dge)
+)
+dir.create(file.path("..", "sample_matching"))
+ggsave(file.path("..", "sample_matching", "matched_sample_table.pdf"), matched_samples_table_plot)
+
+cdk_count_combined <- list(
+  "bulk" = cdk_bulk_counts,
+  "dge" = cdk_dge_counts
+) %>%
+  dplyr::bind_rows(.id = "method") %>%
+  dplyr::filter(ensembl_gene_id %in% cdk_common_ids) %>%
+  dplyr::mutate(sample_id = paste_(method, sample_id)) %>%
+  dplyr::arrange(sample_id)
+
+```
+
+
+```{r writing_data_disk}
+readr::write_csv(cdk_bulk_meta, file.path("..", "wrangled", "cdk_bulk_meta.csv"))
+readr::write_csv(cdk_bulk_counts, file.path("..", "wrangled", "cdk_bulk_counts.csv.gz"))
+
+readr::write_csv(cdk_dge_meta, file.path("..", "wrangled", "cdk_dge_meta.csv"))
+readr::write_csv(cdk_dge_counts, file.path("..", "wrangled", "cdk_dge_counts.csv.gz"))
+
+readr::write_csv(cdk_meta_combined, file.path("..", "wrangled", "cdk_meta_combined.csv"))
+readr::write_csv(cdk_count_combined, file.path("..", "wrangled", "cdk_count_combined.csv.gz"))
+
+readr::write_rds(matched_samples, file.path("..", "wrangled", "cdk_meta_matched_samples.rds"))
+
+readr::write_csv(ensembl_gene_id_mapping, file.path("..", "wrangled", "ensembl_gene_id_mapping.csv"))
+```

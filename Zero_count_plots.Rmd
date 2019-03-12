@@ -1,0 +1,485 @@
+
+```{r loading}
+# library(synExtra)
+library(tidyverse)
+library(patchwork)
+
+# synapser::synLogin()
+# syn <- synExtra::synDownloader("~/data/DGE_comp/")
+# syn_csv <- function(synid, ...) {
+#   syn(synid) %>%
+#     readr::read_csv(...)
+# }
+# syn_tsv <- function(synid, ...) {
+#   syn(synid) %>%
+#     readr::read_tsv(...)
+# }
+paste_ <- function(...) {
+  paste(..., sep = "_")
+}
+```
+
+
+```{r datasets}
+# norm_counts <- readr::read_csv("norm_counts_comp.csv.gz") %>%
+#   tidyr::gather(key = "sample_id", value = "norm_count", -ensembl_gene_id)
+# cdk_meta_combined <- readr::read_csv("cdk_meta_combined.csv")
+# matched_samples <- readRDS("matched_samples.rds") %>%
+#   dplyr::mutate(condition = paste_(cell_line, drug, concentration, time))
+
+deseq <- readr::read_rds(file.path("deseq", "deseq_datasets.rds"))
+
+ensembl_gene_id_mapping <- readr::read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv")) 
+
+l1000 <- readr::read_csv(file.path("wrangled", "l1000_gene_list.csv"))
+l1000_ensembl_gene_ids <- l1000 %>%
+  dplyr::left_join(ensembl_gene_id_mapping, by = c("gene_symbol" = "symbol")) %>%
+  tidyr::drop_na(ensembl_gene_id) %>%
+  .$ensembl_gene_id
+
+```
+Investigating the proportion of problematic zero counts in DGE vs bulk RNA-seq.
+
+## Modeling expected zeroes using negative binomial distribution
+
+```{r expected_zeros}
+# https://github.com/mikelove/DESeq2/blob/600c6c20fca6c2d54148bea17ac31c424ac69336/R/core.R#L407
+# Essentially calculating probability of observing exactly 0 counts for a single
+# draw from the negative binomial distribution using the parameters estimated by
+# DESeq2. Using the empirical dispersion and the average, size factor corrected
+# expression count as "mean parameter" (mu) of the distribution
+zero_probs <- deseq %>%
+  purrr::map(
+    function (des) {
+      dispersion <- DESeq2::dispersions(des)
+      base_mean <- SummarizedExperiment::rowData(des)$baseMean
+      tibble::tibble(
+        ensembl_gene_id = row.names(des),
+        base_mean = base_mean,
+        dispersion = dispersion,
+        probability = pnbinom(0, mu = base_mean, size = 1/dispersion)
+      )
+    }
+  )
+
+ggsave(file.path("example", "mu_dispersion_table.pdf"), gridExtra::tableGrob(head(zero_probs$dge)))
+
+```
+
+```{r zero_probs_point_plot}
+zero_probs_dge_vs_bulk_point_plot <- zero_probs[c("dge", "bulk")] %>%
+  dplyr::bind_rows(.id = "method") %>%
+  tidyr::spread(method, probability) %>%
+  ggplot(aes(bulk, dge)) +
+    geom_point() +
+    scale_x_log10(limits = c(1e-20, 1)) +
+    scale_y_log10(limits = c(1e-20, 1))
+zero_probs_dge_vs_bulk_point_plot
+dir.create("zeroes", showWarnings = FALSE)
+ggsave(file.path("zeroes", "zero_probs_dge_vs_bulk_point_plot.pdf"), zero_probs_dge_vs_bulk_point_plot)
+```
+
+Very hard to make out actual trend due to huge dynamic range of probabilities, not
+even log10 scale can make up for. Trying to bin sensibly instead and show as
+heatmap.
+
+```{r zero_probs_heatmap}
+zero_prop_bins <- c(-Inf, 10**-rev(1:3), +Inf)
+zero_prop_bin_labels <- c("<0.001", "(0.001, 0.01]", "(0.01, 0.1]", ">0.1")
+zero_props_binned <- zero_probs[c("dge", "bulk")] %>%
+  dplyr::bind_rows(.id = "method") %>%
+  tidyr::spread(method, probability) %>%
+  tidyr::drop_na() %>%
+  dplyr::mutate_at(
+    dplyr::vars(dge, bulk),
+    cut, breaks = zero_prop_bins, labels = zero_prop_bin_labels, right = TRUE
+  ) %>%
+  dplyr::mutate(l1000 = ensembl_gene_id %in% l1000_ensembl_gene_ids)
+
+n_genes <- length(unique(above_1_3_reps_probs$ensembl_gene_id))
+
+zero_probs_dge_vs_bulk_heatmap <- zero_props_binned %>%
+  dplyr::group_by(bulk, dge) %>%
+  dplyr::summarize(n = n(), fraction = n/n_genes, fraction_p = paste0(formatC(100*fraction, 3, format = "fg"), "%")) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(bulk, dge, fill = fraction)) +
+    geom_raster() +
+    geom_text(aes(label = fraction_p), color = "white") +
+    scale_fill_continuous(trans = "log10") +
+    labs(
+      x = "Probability of observing zero (Bulk)",
+      y = "Probability of observing zero (DGE)",
+      fill = "Fraction\nof genes"
+    )
+theme_no_x <- theme(
+  axis.title.x = element_blank(),
+  axis.text.x = element_blank(),
+  axis.ticks.x = element_blank()
+)
+theme_no_y <- theme(
+  axis.title.y = element_blank(),
+  axis.text.y = element_blank(),
+  axis.ticks.y = element_blank()
+)
+
+marginal_x <- zero_props_binned %>%
+  dplyr::group_by(l1000) %>%
+  dplyr::mutate(total = length(unique(ensembl_gene_id))) %>%
+  dplyr::group_by(bulk, l1000) %>%
+  dplyr::summarize(n = n(), fraction = n/unique(total), fraction_p = paste0(formatC(100*fraction, 3, format = "fg"), "%")) %>%
+  ggplot(aes(bulk, fraction, fill = l1000)) +
+    geom_col(position = "dodge") +
+    theme_no_x +
+    labs(y = "Fraction of genes")
+
+marginal_y <- zero_props_binned %>%
+  dplyr::group_by(l1000) %>%
+  dplyr::mutate(total = length(unique(ensembl_gene_id))) %>%
+  dplyr::group_by(dge, l1000) %>%
+  dplyr::summarize(n = n(), fraction = n/unique(total), fraction_p = paste0(formatC(100*fraction, 3, format = "fg"), "%")) %>%
+  ggplot(aes(dge, fraction, fill = l1000)) +
+    geom_col(position = "dodge") +
+    theme_no_y +
+    coord_flip() +
+    guides(fill = FALSE) +
+    labs(y = "Fraction of genes")
+
+zero_probs_dge_vs_bulk_heatmap_combined <- marginal_x + patchwork::plot_spacer() +
+  zero_probs_dge_vs_bulk_heatmap + marginal_y +
+  patchwork::plot_layout(widths = c(2.5, 1), heights = c(1, 3))
+ggsave(file.path("zeroes", "zero_probs_dge_vs_bulk_heatmap.pdf"), zero_probs_dge_vs_bulk_heatmap_combined, width = 7, height = 5)
+```
+
+The probability of observing a zero count is much higher for most genes using the
+DGE method than bulk RNA-seq.
+
+Also checking probability of observing >0 count in all three replicates per gene.
+
+Modelling three replicates as three draws from a binomial distribution where p is
+the probability of observing a count >0 from the negative binomial distribution
+used before. Recording the probability of three "successes".
+
+Probability of >0 zero count is inverse of observing zero calculated before.
+
+```{r zero_probs_three_reps}
+above_1_3_reps_breaks <- c(-Inf, 0.05, .5, .95, Inf)
+above_1_3_reps_labels <- c("<.1", "(.01, .5]", "(.5, .9]", ">.9")
+above_1_3_reps_probs <- zero_probs[c("dge", "bulk")] %>%
+  dplyr::bind_rows(.id = "method") %>%
+  dplyr::mutate(probability = dbinom(3, 3, 1 - probability)) %>%
+  tidyr::spread(method, probability) %>%
+  tidyr::drop_na() %>%
+  dplyr::mutate_at(
+    dplyr::vars(dge, bulk),
+    cut, breaks = above_1_3_reps_breaks, labels = above_1_3_reps_labels, right = TRUE
+  ) %>%
+  dplyr::mutate(l1000 = ensembl_gene_id %in% l1000_ensembl_gene_ids)
+
+
+above_1_3_reps_dge_vs_bulk_heatmap <- above_1_3_reps_probs %>%
+  dplyr::group_by(bulk, dge) %>%
+  dplyr::summarize(n = n(), fraction = n/n_genes, fraction_p = paste0(formatC(100*fraction, 3, format = "fg"), "%")) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(bulk, dge, fill = fraction)) +
+    geom_raster() +
+    geom_text(aes(label = fraction_p), color = "white") +
+    scale_fill_continuous(trans = "log10") +
+    labs(
+      x = "Probability of three reps >0 (Bulk)",
+      y = "Probability of three reps >0 (DGE)",
+      fill = "Fraction\nof genes"
+    )
+
+marginal_x <- above_1_3_reps_probs %>%
+  dplyr::group_by(l1000) %>%
+  dplyr::mutate(total = length(unique(ensembl_gene_id))) %>%
+  dplyr::group_by(bulk, l1000) %>%
+  dplyr::summarize(n = n(), fraction = n/unique(total), fraction_p = paste0(formatC(100*fraction, 3, format = "fg"), "%")) %>%
+  ggplot(aes(bulk, fraction, fill = l1000)) +
+    geom_col(position = "dodge") +
+    theme_no_x +
+    labs(y = "Fraction of genes")
+
+marginal_y <- above_1_3_reps_probs %>%
+  dplyr::group_by(l1000) %>%
+  dplyr::mutate(total = length(unique(ensembl_gene_id))) %>%
+  dplyr::group_by(dge, l1000) %>%
+  dplyr::summarize(n = n(), fraction = n/unique(total), fraction_p = paste0(formatC(100*fraction, 3, format = "fg"), "%")) %>%
+  ggplot(aes(dge, fraction, fill = l1000)) +
+    geom_col(position = "dodge") +
+    theme_no_y +
+    coord_flip() +
+    guides(fill = FALSE) +
+    labs(y = "Fraction of genes")
+
+above_1_3_reps_dge_vs_bulk_heatmap_combined <- marginal_x + patchwork::plot_spacer() +
+  above_1_3_reps_dge_vs_bulk_heatmap + marginal_y +
+  patchwork::plot_layout(widths = c(2.5, 1), heights = c(1, 3))
+ggsave(file.path("zeroes", "above_1_3_reps_dge_vs_bulk_heatmap.pdf"), above_1_3_reps_dge_vs_bulk_heatmap_combined, width = 7, height = 5)
+```
+
+Now that we have an idea which genes can be reliably detected using DGE, we can
+also have a look at the distribution of actual counts and compare them.
+
+Estimating mode, most likely gene expression value, of each gene based on the
+parameters of the negative binomial distribution generated by DESeq2.
+
+Mean of the NB distribution is equal to baseMean, btw (just small numerical errors).
+Makes sense, since the model is fitted so that the result of multiplying the
+coefficient matrix with the model matrix equals the baseMean. So probably it makes
+more sense to just use the mean instead of the mode.
+
+```{r distribution_mode_expression}
+modes <- deseq %>%
+  purrr::map(
+    function (des) {
+      dispersion <- DESeq2::dispersions(des)
+      base_mean <- SummarizedExperiment::rowData(des)$baseMean
+      alpha <- 1/dispersion
+      p <- alpha/(alpha + base_mean)
+      browser()
+      tibble::tibble(
+        probability_alt = pnbinom(0, mu = base_mean, size = alpha),
+        probability = pnbinom(0, prob = p, size = alpha),
+        # https://www.boost.org/doc/libs/1_46_1/libs/math/doc/sf_and_dist/html/math_toolkit/dist/dist_ref/dists/negative_binomial_dist.html
+        mode = ifelse(alpha > 1, (alpha - 1)*(1 - p)/p, 0),
+        mean = alpha*(1 - p)/p,
+        ensembl_gene_id = row.names(des),
+        minimum = DESeq2::counts(des, normalized = TRUE) %>%
+          as.matrix() %>%
+          apply(1, min),
+        p = p,
+        alpha = alpha,
+        dispersion = dispersion,
+        base_mean = base_mean
+      )
+    }
+  )
+
+counts_bulk <- DESeq2::counts(deseq$bulk, normalized = TRUE) %>%
+  as.matrix()
+
+order_bulk <- order(-apply(counts_bulk, 1, sum))
+
+highest <- t(counts_bulk[order_bulk,])
+
+breaks <- 10**seq(from = -2, 5, length.out = 20)
+
+# modes_dge_vs_bulk <- modes[c("dge", "bulk")] %>%
+#   dplyr::bind_rows(.id = "method") %>%
+#   dplyr::mutate(
+#     l1000 = ensembl_gene_id %in% l1000_ensembl_gene_ids,
+#     mode = ifelse(mode < .1, .1, mode)
+#   ) %>%
+#   ggplot(aes(mode, stat(density), fill = l1000)) +
+#     geom_histogram(position = "dodge", breaks = breaks) +
+#     facet_wrap(~method, ncol = 1) +
+#     scale_x_log10()
+
+
+modes_dge_vs_bulk <- modes[c("dge", "bulk")] %>%
+  dplyr::bind_rows(.id = "method") %>%
+  dplyr::mutate(
+    l1000 = ensembl_gene_id %in% l1000_ensembl_gene_ids,
+    mode = ifelse(mode < .1, .1, mode)
+  ) %>%
+  ggplot(aes(mode, stat(density), color = l1000)) +
+    geom_step(stat = "bin", breaks = breaks, size = 1) +
+    facet_wrap(~method, ncol = 1) +
+    scale_x_log10()
+ggsave(file.path("zeroes", "histogram_mode_expression.pdf"), modes_dge_vs_bulk,
+       width = 5, height = 7)
+
+mean_dge_vs_bulk <- modes[c("dge", "bulk")] %>%
+  dplyr::bind_rows(.id = "method") %>%
+  dplyr::mutate(
+    l1000 = ensembl_gene_id %in% l1000_ensembl_gene_ids,
+    mean = ifelse(mean < .1, .1, mean)
+  ) %>%
+  ggplot(aes(mean, stat(density), color = l1000)) +
+    geom_step(stat = "bin", breaks = breaks, size = 1) +
+    facet_wrap(~method, ncol = 1) +
+    scale_x_log10() +
+    labs(x = "Mean count", y = "Density", color = "L1000 gene")
+ggsave(file.path("zeroes", "histogram_mean_expression.pdf"), mean_dge_vs_bulk,
+       width = 5, height = 7)
+
+min_dge_vs_bulk <- modes[c("dge", "bulk")] %>%
+  dplyr::bind_rows(.id = "method") %>%
+  dplyr::mutate(
+    l1000 = ensembl_gene_id %in% l1000_ensembl_gene_ids,
+    minimum = ifelse(minimum < .1, .1, minimum)
+  ) %>%
+  ggplot(aes(minimum, stat(density), color = l1000)) +
+    geom_step(stat = "bin", breaks = breaks, size = 1) +
+    facet_wrap(~method, ncol = 1) +
+    scale_x_log10() +
+    labs(x = "Minimum count", y = "Density", color = "L1000 gene")
+ggsave(file.path("zeroes", "histogram_min_expression.pdf"), min_dge_vs_bulk,
+       width = 5, height = 7)
+
+```
+
+Some assays with limited input material, especially single-cell RNA-seq, are known
+to have more zero counts than expected by the NB model. Testing if DGE is also showing
+evidence of this.
+
+Comparing the expected rate of zeroes by NB model to the actual empirical rate.
+
+```{r zero_inflation}
+zero_inflation <- cdk_count_combined %>%
+  dplyr::group_by(ensembl_gene_id, method) %>%
+  dplyr::summarize(zero_fraction = sum(count < 1)/n(), n = n()) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(
+    zero_probs[c("dge", "bulk")] %>%
+      dplyr::bind_rows(.id = "method"),
+    by = c("ensembl_gene_id", "method")
+  ) %>%
+  dplyr::mutate(
+    # expected_fraction = purrr::map2_dbl(
+    #   probability, n,
+    #   ~1 - dbinom(0, prob = .x, size = .y)
+    # ),
+    actual_by_expected = zero_fraction/probability
+  )
+
+zero_inflation_scatter_plot <- zero_inflation %>%
+  dplyr::select(ensembl_gene_id, method, actual_by_expected) %>%
+  tidyr::spread(method, actual_by_expected) %>%
+  dplyr::filter_at(dplyr::vars(dge, bulk), dplyr::all_vars(is.finite(.))) %>%
+  ggplot(aes(dge, bulk)) +
+    geom_point()
+
+zero_inflation_scatter_plot <- zero_inflation %>%
+  ggplot(aes(zero_fraction, probability)) +
+    geom_point() +
+    facet_wrap(~method) +
+    scale_x_log10(limits = c(1e-3, 1)) +
+    scale_y_log10(limits = c(1e-20, 1))
+
+zero_inflation_count_scatter_plot <- zero_inflation %>%
+  dplyr::mutate(
+    true_rate = n*zero_fraction,
+    expected_rate = n*probability,
+    l1000 = ensembl_gene_id %in% l1000_ensembl_gene_ids
+  ) %>%
+  dplyr::arrange(l1000) %>%
+  ggplot(aes(expected_rate, true_rate, color = l1000)) +
+    geom_point() +
+    facet_wrap(~method, scale = "free") +
+    scale_color_manual(values = c(`TRUE` = "red", `FALSE` = "black"))
+ggsave(file.path("zeroes", "zero_rate_vs_expected.pdf"), zero_inflation_count_scatter_plot,
+       width = 7, height = 5)
+
+```
+
+
+
+```{r exploring_distribution_params}
+  
+# mu vs base_mean
+base_mean <- SummarizedExperiment::rowData(deseq$dge) %>%
+  tibble::as_tibble() %>%
+  dplyr::mutate(ensembl_gene_id = row.names(deseq$dge)) %>%
+  dplyr::select(ensembl_gene_id, baseMean)
+
+mus <- SummarizedExperiment::assay(deseq$dge, "mu")[, 1:10] %>%
+  tibble::as_tibble(rownames = "ensembl_gene_id") %>%
+  tidyr::gather("sample_id", "mu", -ensembl_gene_id)
+
+nc <- DESeq2::counts(deseq$dge, normalized = TRUE) %>%
+  tibble::as_tibble(rownames = "ensembl_gene_id") %>%
+  tidyr::gather("sample_id", "count", -ensembl_gene_id)
+
+sf <- tibble::tibble(
+  size_factor = DESeq2::sizeFactors(deseq$dge),
+  sample_id = colnames(deseq$dge)
+)
+
+central_estimates <- mus %>%
+  dplyr::left_join(base_mean, by = "ensembl_gene_id") %>%
+  dplyr::left_join(nc, by = c("sample_id", "ensembl_gene_id")) %>%
+  dplyr::left_join(sf, by = "sample_id")
+
+mu_base_mean_plot <- central_estimates %>%
+  ggplot(aes(mu, baseMean)) +
+    geom_point() +
+    facet_wrap(~sample_id)
+
+mu_norm_count_plot <- central_estimates %>%
+  ggplot(aes(mu, count)) +
+    geom_point() +
+    facet_wrap(~sample_id)
+
+mu_by_sf_norm_count_plot <- central_estimates %>%
+  ggplot(aes(mu/size_factor, count)) +
+    geom_point() +
+    facet_wrap(~sample_id)
+
+
+```
+
+```{r fraction_zeroes}
+zero_fractions <- matched_samples %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    zeroes = purrr::map(
+      sample_ids,
+      function (ids) {
+        norm_counts %>%
+          dplyr::filter(sample_id %in% ids) %>%
+          dplyr::left_join(cdk_meta_combined %>% dplyr::select(sample_id, method), by = "sample_id") %>%
+          dplyr::group_by(ensembl_gene_id, method) %>%
+          dplyr::summarize(frac = sum(norm_count < 0.00000001)/n(), n_zero = sum(norm_count < 0.00000001)) %>%
+          dplyr::ungroup()
+      }
+    )
+  ) %>%
+  dplyr::select(condition, zeroes) %>%
+  tidyr::unnest(zeroes)
+
+zero_fractions_plot <- zero_fractions %>%
+  ggplot(aes(x = dge, y = bulk)) +
+    geom_point() +
+    facet_wrap(~condition)
+
+zero_fractions_hm <- zero_fractions %>%
+  dplyr::select(-frac) %>%
+  tidyr::spread(method, n_zero) %>%
+  dplyr::count(condition, bulk, dge) %>%
+  ggplot(aes(x = dge, y = bulk, fill = n)) +
+    geom_raster() +
+    facet_wrap(~condition, scales = "free") +
+    scale_fill_viridis_c(trans = "log10")
+ggsave("zero_fractions_heatmap.pdf", zero_fractions_hm)
+
+zero_cont_tables <-  zero_fractions %>%
+  dplyr::select(-frac) %>%
+  tidyr::spread(method, n_zero) %>%
+  dplyr::count(condition, bulk, dge) %>%
+  split(.$condition) %>%
+  purrr::map(
+    ~tidyr::spread(.x, dge, n) %>%
+      dplyr::select(-condition) %>%
+      as.data.frame() %>%
+      `row.names<-`(.$bulk) %>%
+      dplyr::select(-bulk) %>%
+      as.matrix()
+  )
+
+zero_cont_tauc <- purrr::map(
+  zero_cont_tables,
+  DescTools::StuartTauC, conf.level = .95
+)
+
+zero_cont_taub <- purrr::map(
+  zero_fractions %>%
+    dplyr::select(-frac) %>%
+    tidyr::spread(method, n_zero) %>%
+    split(.$condition),
+  ~cor.test(.x$dge, .x$bulk, alternative = "two.sided", method = "kendall")
+)
+
+```
+
