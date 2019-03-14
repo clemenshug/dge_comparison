@@ -7,16 +7,30 @@ output: html_document
 
 ```{r setup, include=FALSE}
 library(tidyverse)
-library(DESeq2)
-library(VennDiagram)
-library(UpSetR)
 library(cmapR)
 library(patchwork)
+library(egg)
 
 paste_ <- function(...) {
   paste(..., sep = "_")
 }
+
+theme_set(theme_bw())
 ```
+
+
+# Goal
+
+One of the goals of DGE experiments is to characterize the impact of drug treatment
+the transcriptome with a cheap and scalable experiment. CMap is one of the existing
+resources with a large datase of drug treaments. CMap uses an assay called L1000
+to measure expression of ~1000 selected genes, representative of the larger
+transcriptome.
+
+The goal of this analysis is to
+
+1. Check if we can reliably detect the L1000 genes with DGE
+2. Compare drug profiles obtained by DGE with L1000 CMap signatures
 
 
 ```{r loading}
@@ -38,8 +52,14 @@ l1000_ensembl_gene_ids <- l1000 %>%
   .$ensembl_gene_id
 ```
 
+## L1000 genes in DGE
 
-```{r detected_l1000_genes}
+First, using naive threshold to define "detectable" genes. Requiring at least
+5 counts seems adequate.
+
+
+```{r distribution_l1000_counts}
+# Using only raw counts for this analysis
 l1000_counts <- counts %>%
   filter(comparison %in% c("dge", "bulk"), normalization == "raw") %>%
   mutate(l1000 = ifelse(gene_id %in% l1000_ensembl_gene_ids, "l1000", "not_l1000"))
@@ -58,12 +78,20 @@ l1000_line_data <- l1000_counts %>%
   )
 
 l1000_line_plot <- l1000_line_data %>%
-  map(
+  imap(
     ~ggplot(., aes(as.integer(gene_id), count + .1)) +
       geom_line(aes(color = quantile, group = quantile)) +
       facet_wrap(~l1000) +
-      scale_y_log10()
-  )
+      scale_y_log10() +
+      ggtitle(.y)
+  ) %>%
+  wrap_plots(ncol = 1)
+ggsave(file.path("cmap_overlap", "l1000_count_distribution.pdf"), l1000_line_plot)
+```
+
+
+
+```{r detectable_l1000}
 
 detectable_threshold <- 5
 fraction_detectable <- l1000_counts %>%
@@ -76,45 +104,84 @@ fraction_detectable_plot <- fraction_detectable %>%
     geom_violin(draw_quantiles = c(.25, .5, .75)) +
     ggtitle("Fraction of genes ≥5")
 ggsave(file.path("cmap_overlap", "fraction_detectable.pdf"), fraction_detectable_plot, width = 5, height = 5)
+```
 
+Also plotting how often each gene is detectable across samples.
+
+```{r fraction_detectable_per_gene}
 fraction_detectable_per_gene <- l1000_counts %>%
   mutate(detectable = count >= detectable_threshold) %>%
-  group_by(comparison, gene_id) %>%
-  summarize(fraction_detectable = sum(detectable)/n(), l1000 = l1000[1]) %>%
-  spread(comparison, fraction_detectable)
+  group_by(comparison, gene_id, l1000) %>%
+  summarize(fraction_detectable = sum(detectable)/n()) %>%
+  ungroup()
 
-fraction_detectable_per_gene_plot <- fraction_detectable_per_gene %>%
-  ggplot(aes(bulk, dge, color = l1000)) +
-    geom_point()
+marginal_ecdf_fraction_detectable <- fraction_detectable_per_gene %>%
+  group_by(l1000, comparison) %>%
+  do(
+    plot = (function (df, comparison) {
+      p <- ggplot(df, aes(fraction_detectable)) +
+        geom_histogram(aes(y = stat(count)/sum(stat(count))), breaks = seq(from = 0, to = 1, length.out = 10), closed = "right") +
+        stat_ecdf(geom = "step") +
+        # geom_density() +
+        labs(
+          x = NULL,
+          y = "Fraction\nof genes"
+        ) +
+        lims(x = c(0, 1))
+      if (df$comparison[1] == "dge") p <- p + scale_y_reverse() + coord_flip()
+      p
+    })(.)
+  )
 
-fraction_detectable_per_gene_plot_hex <- fraction_detectable_per_gene %>%
+# Output kernel density estimates for each input point defined by vectors x, y
+# Adapted from grDevices::densCols to output densities instead of colors
+density_2d <- function (x, y = NULL, nbin = 128, bandwidth) {
+  xy <- xy.coords(x, y, setLab = FALSE)
+  select <- is.finite(xy$x) & is.finite(xy$y)
+  x <- cbind(xy$x, xy$y)[select, ]
+  map <- grDevices:::.smoothScatterCalcDensity(x, nbin, bandwidth)
+  mkBreaks <- function(u) u - diff(range(u))/(length(u) - 1)/2
+  xbin <- cut(x[, 1], mkBreaks(map$x1), labels = FALSE)
+  ybin <- cut(x[, 2], mkBreaks(map$x2), labels = FALSE)
+  dens <- map$fhat[cbind(xbin, ybin)]
+  dens[is.na(dens)] <- 0
+  dens
+}
+
+fraction_detectable_per_gene_density_scatter <- fraction_detectable_per_gene %>%
+  spread(comparison, fraction_detectable) %>%
   split(.$l1000) %>%
+  map(mutate, density = density_2d(bulk, dge)) %>%
+  # Arrange by density so that points with highest density are on top of plot
+  map(arrange, density) %>%
   imap(
-    ~ggplot(.x, aes(bulk, dge)) +
-      geom_hex() +
-      ggtitle(.y) +
-      coord_fixed()
-  ) %>%
-  wrap_plots(ncol = 1)
-
-fraction_detectable_per_gene_plot_density_scatter <- fraction_detectable_per_gene %>%
-  split(.$l1000) %>%
-  map(mutate, density = as.numeric(densCols(bulk, dge, colramp = function(n) seq(from = 0, to = n, length.out = n)))) %>%
-  imap(
-    ~ggplot(.x, aes(bulk, dge, color = density)) +
-      geom_point() +
-      coord_fixed() +
-      lims(x = c(0, 1), y = c(0, 1)) +
-      labs(
-        x = "RNA-seq (fraction of samples\nwith expression >5)",
-        y = "DGE (fraction of samples\nwith expression >5)",
-        title = .y,
-        color = "Number of\ngenes"
+    function(df, gene_set) {
+      p <- ggplot(df, aes(bulk, dge, color = density)) +
+        geom_point() +
+        coord_fixed() +
+        lims(x = c(0, 1), y = c(0, 1)) +
+        labs(
+          x = "RNA-seq (fraction of samples\nwith expression >5)",
+          y = "DGE (fraction of samples\nwith expression >5)",
+          color = "Density of\ngenes",
+          title = gene_set
+        ) +
+        scale_color_viridis_c()
+      egg::ggarrange(
+        plots = list(
+          ggplot() + theme_void(),
+          filter(marginal_ecdf_fraction_detectable, l1000 == gene_set, comparison == "bulk")$plot[[1]],
+          filter(marginal_ecdf_fraction_detectable, l1000 == gene_set, comparison == "dge")$plot[[1]],
+          p
+        ),
+        widths = c(1, 4),
+        heights = c(1, 3),
       )
+    }
   ) %>%
   wrap_plots(ncol = 1)
-ggsave(file.path("cmap_overlap", "fraction_detectable_per_gene_density_scatter.pdf"), fraction_detectable_per_gene_plot_density_scatter, width = 4, height = 8)
-# Plot dge vs bulk, fraction of detectable plots, 2d histogram, contour map
+ggsave(file.path("cmap_overlap", "fraction_detectable_per_gene_density_scatter.pdf"), fraction_detectable_per_gene_density_scatter, width = 6, height = 8)
+
 ```
 
 
