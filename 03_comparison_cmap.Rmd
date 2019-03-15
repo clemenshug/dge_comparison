@@ -121,7 +121,8 @@ marginal_ecdf_fraction_detectable <- fraction_detectable_per_gene %>%
     plot = (function (df, comparison) {
       p <- ggplot(df, aes(fraction_detectable)) +
         geom_histogram(aes(y = stat(count)/sum(stat(count))), breaks = seq(from = 0, to = 1, length.out = 10), closed = "right") +
-        stat_ecdf(geom = "step") +
+        # stat_ecdf(geom = "step") +
+        geom_step(aes(y = stat(y)), stat = "ecdf") +
         # geom_density() +
         labs(
           x = NULL,

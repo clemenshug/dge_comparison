@@ -1,0 +1,118 @@
+---
+title: "DESeq2 drug treatments vs control"
+author: "Clemens Hug"
+date: "3/15/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(VennDiagram)
+library(UpSetR)
+
+paste_ <- function(...) {
+  paste(..., sep = "_")
+}
+```
+
+Calculating differentially expressed genes between drug treatment conditions
+and control for DGE and bulk RNA-seq separately.
+
+```{r loading}
+cdk_meta_combined <- readr::read_csv(file.path("wrangled", "cdk_meta_combined.csv"))
+cdk_count_combined <- readr::read_csv(file.path("wrangled", "cdk_count_combined.csv.gz"), col_types = "ccicc")
+
+ensembl_gene_id_mapping <- readr::read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv"))
+
+cdk_meta_deseq <- cdk_meta_combined %>%
+  # Generate unique id for each combination of exp parameters
+  dplyr::mutate(condition = paste_(method, cell_line, drug, concentration, time)) %>%
+  as.data.frame() %>%
+  `rownames<-`(.$sample_id)
+
+cdk_count_deseq <- cdk_count_combined %>%
+  dplyr::select(-method, -symbol) %>%
+  tidyr::spread(sample_id, count) %>%
+  as.data.frame() %>%
+  `rownames<-`(.$ensembl_gene_id) %>%
+  dplyr::select(-ensembl_gene_id)
+
+```
+
+Checking which conditions have a complete set of samples, with at least 2 replicates.
+Removing singleton samples without replicate.
+
+Using only 6h time point.
+
+
+```{r building_deseq_meta}
+cdk_comps_meta <- cdk_meta_combined %>%
+  filter(time == 6) %>%
+  # Nesting because I originally planned to do more complex filtering...
+  nest(sample_id) %>%
+  # Keep conditions with >1 replicates
+  filter(map_lgl(data, ~nrow(.x) > 1)) %>%
+  # Check if each condition has a DMSO control
+  group_by(method, cell_line) %>%
+  filter("DMSO" %in% drug) %>%
+  ungroup() %>%
+  # Add DMSO control sample_ids in each condition as a nested df
+  nest_join(
+    filter(., drug == "DMSO") %>% unnest(data),
+    by = c("method", "cell_line", "time"),
+    name = "control"
+  ) %>%
+  # Don't want to compare DMSO with itself...
+  filter(drug != "DMSO") %>%
+  # Bulding DESeq2 metadata for each condition
+  mutate(
+    sample_ids = map2(data, control, bind_rows) %>% map("sample_id"),
+    deseq_meta = map(sample_ids, ~filter(cdk_meta_deseq, sample_id %in% .x))
+  )
+```
+
+
+
+
+
+
+```{r deseq_drugs_vs_control}
+# Adding count matrices for each condition
+cdk_comps_inputs <- cdk_comps_meta %>%
+  mutate(
+    counts = map(sample_ids, ~cdk_count_deseq[, .x])
+  )
+
+run_deseq_comp <- function(meta, counts, design=~drug) {
+  library(tidyverse)
+  suppressMessages(
+    DESeq2::DESeqDataSetFromMatrix(
+      counts,
+      meta,
+      design = design
+    )
+  ) %>%
+    DESeq2::DESeq()
+}
+
+n_workers = 8
+tryCatch({
+    compute_cluster <- parallel::makeCluster(n_workers, outfile = "deseq_worker.log")
+    cdk_deseq_res <- cdk_comps_inputs %>%
+      mutate(
+        deseq_res = parallel::clusterMap(
+          compute_cluster,
+          run_deseq_comp,
+          meta = deseq_meta,
+          counts = counts
+        )
+      )
+  },
+  finally = {
+    message("Stopped cluster")
+    parallel::stopCluster(compute_cluster)
+})
+
+readr::write_rds(cdk_deseq_res, file.path("deseq", "deseq_treatment_vs_control.rds"))
+```
