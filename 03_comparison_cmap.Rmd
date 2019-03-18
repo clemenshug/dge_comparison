@@ -115,25 +115,6 @@ fraction_detectable_per_gene <- l1000_counts %>%
   summarize(fraction_detectable = sum(detectable)/n()) %>%
   ungroup()
 
-marginal_ecdf_fraction_detectable <- fraction_detectable_per_gene %>%
-  group_by(l1000, comparison) %>%
-  do(
-    plot = (function (df, comparison) {
-      p <- ggplot(df, aes(fraction_detectable)) +
-        geom_histogram(aes(y = stat(count)/sum(stat(count))), breaks = seq(from = 0, to = 1, length.out = 10), closed = "right") +
-        # stat_ecdf(geom = "step") +
-        geom_step(aes(y = stat(y)), stat = "ecdf") +
-        # geom_density() +
-        labs(
-          x = NULL,
-          y = "Fraction\nof genes"
-        ) +
-        lims(x = c(0, 1))
-      if (df$comparison[1] == "dge") p <- p + scale_y_reverse() + coord_flip()
-      p
-    })(.)
-  )
-
 # Output kernel density estimates for each input point defined by vectors x, y
 # Adapted from grDevices::densCols to output densities instead of colors
 density_2d <- function (x, y = NULL, nbin = 128, bandwidth) {
@@ -149,35 +130,75 @@ density_2d <- function (x, y = NULL, nbin = 128, bandwidth) {
   dens
 }
 
+density_2d_plot <- function (
+  data, aesthetics,
+  histogram_args = list(bins = 10), scatter_elements = list(), margin_elements = list()
+) {
+  marginals <- aesthetics[c("x", "y")] %>%
+    imap(
+      function (axis_var, axis) {
+        p <- ggplot(data, aes(!!axis_var)) +
+          rlang::exec(
+            geom_histogram,
+            aes(y = stat(count)/sum(stat(count))),
+            !!!histogram_args
+          ) +
+          geom_step(aes(y = stat(y)), stat = "ecdf") +
+          margin_elements
+        if (axis == "y") p <- p + scale_y_reverse() + coord_flip()
+        p
+      }
+    )
+  density_data <- data %>%
+    mutate(density = density_2d(!!aesthetics$x, !!aesthetics$y)) %>%
+    arrange(density)
+  p <- ggplot(density_data, aesthetics) +
+    geom_point() +
+    scatter_elements
+  egg::ggarrange(
+    plots = list(
+      ggplot() + theme_void(),
+      marginals$x,
+      marginals$y,
+      p
+    ),
+    widths = c(1, 4),
+    heights = c(1, 3)
+  )
+}
+
 fraction_detectable_per_gene_density_scatter <- fraction_detectable_per_gene %>%
   spread(comparison, fraction_detectable) %>%
   split(.$l1000) %>%
-  map(mutate, density = density_2d(bulk, dge)) %>%
-  # Arrange by density so that points with highest density are on top of plot
-  map(arrange, density) %>%
   imap(
     function(df, gene_set) {
-      p <- ggplot(df, aes(bulk, dge, color = density)) +
-        geom_point() +
-        coord_fixed() +
-        lims(x = c(0, 1), y = c(0, 1)) +
-        labs(
-          x = "RNA-seq (fraction of samples\nwith expression >5)",
-          y = "DGE (fraction of samples\nwith expression >5)",
-          color = "Density of\ngenes",
-          title = gene_set
-        ) +
-        scale_color_viridis_c()
-      egg::ggarrange(
-        plots = list(
-          ggplot() + theme_void(),
-          filter(marginal_ecdf_fraction_detectable, l1000 == gene_set, comparison == "bulk")$plot[[1]],
-          filter(marginal_ecdf_fraction_detectable, l1000 == gene_set, comparison == "dge")$plot[[1]],
-          p
+      p <- density_2d_plot(
+        df,
+        aes(bulk, dge, color = density),
+        histogram_args = list(
+          breaks = seq(from = 0, to =1, length.out = 10),
+          closed = "right"
         ),
-        widths = c(1, 4),
-        heights = c(1, 3),
+        scatter_elements = list(
+          coord_fixed(),
+          lims(x = c(0, 1), y = c(0, 1)),
+          labs(
+            x = "RNA-seq (fraction of samples\nwith expression >5)",
+            y = "DGE (fraction of samples\nwith expression >5)",
+            color = "Density of\ngenes",
+            title = gene_set
+          ),
+          scale_color_viridis_c()
+        ),
+        margin_elements = list(
+          lims(x = c(0, 1)),
+          labs(
+            x = NULL,
+            y = "Fraction\ngenes"
+          )
+        )
       )
+      p
     }
   ) %>%
   wrap_plots(ncol = 1)
@@ -217,4 +238,21 @@ ggsave(
 
 cmap_meta <- cmapR::read.gctx.meta(cmap_path, dimension = "row")
 
+```
+
+```{r fraction_tractable_deseq}
+deseq_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_control.rds"))
+
+fraction_tractable <- deseq_treatment_vs_control %>%
+  mutate(res_df = map(deseq_res, as.tibble, rownames = "gene_id")) %>%
+  select(method, cell_line, drug, concentration, time, res_df) %>%
+  unnest(res_df) %>%
+  mutate(
+    tractable = !is.na(padj),
+    is_l1000 = gene_id %in% l1000_ensembl_gene_ids
+  )
+
+p <- ggplot(fraction_tractable, aes(baseMean)) +
+  geom_histogram() +
+  facet_wrap(method~tractable, scales = "free")
 ```

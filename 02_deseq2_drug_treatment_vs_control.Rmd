@@ -101,11 +101,15 @@ tryCatch({
     compute_cluster <- parallel::makeCluster(n_workers, outfile = "deseq_worker.log")
     cdk_deseq_res <- cdk_comps_inputs %>%
       mutate(
-        deseq_res = parallel::clusterMap(
+        deseq = parallel::clusterMap(
           compute_cluster,
           run_deseq_comp,
           meta = deseq_meta,
           counts = counts
+        ),
+        deseq_res = map(
+          deseq,
+          DESeq2::results
         )
       )
   },
