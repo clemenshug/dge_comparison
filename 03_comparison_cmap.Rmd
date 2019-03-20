@@ -50,6 +50,8 @@ l1000_ensembl_gene_ids <- l1000 %>%
   dplyr::left_join(ensembl_gene_id_mapping, by = c("gene_symbol" = "symbol")) %>%
   tidyr::drop_na(ensembl_gene_id) %>%
   .$ensembl_gene_id
+
+drug_ids <- read_csv(file.path("wrangled", "lincs_drug_ids.csv"))
 ```
 
 ## L1000 genes in DGE
@@ -208,22 +210,112 @@ ggsave(file.path("cmap_overlap", "fraction_detectable_per_gene_density_scatter.p
 
 
 
+
+## Genes tractable for differential expression by DESeq2
+
+Another idea to quantify the proportion of L1000 genes that are detectable by
+DGE is to perform pairwise comparisons of drug treatment and DMSO using DESeq2.
+and quantifying how many genes are passing the DESeq2 filtering steps. Hope that
+this is more practically relevant than arbitrary thresholds above.
+
+DESeq2 does independent filtering based on the Bioconductor genefilter package 
+to increase power of differential expression analysis. The default filter
+takes into account the average expression of each gene across all replicates and
+conditions. Genes that pass filter are "tractable" by DESeq2 for differential
+expression.
+
+```{r fraction_tractable_deseq}
+deseq_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_control.rds"))
+
+fraction_tractable <- deseq_treatment_vs_control %>%
+  mutate(res_df = map(deseq_res, as.tibble, rownames = "gene_id")) %>%
+  select(method, cell_line, drug, concentration, time, res_df) %>%
+  unnest(res_df) %>%
+  mutate(
+    tractable = !is.na(padj),
+    is_l1000 = ifelse(gene_id %in% l1000_ensembl_gene_ids, "l1000", "not_l1000")
+  )
+
+fraction_tractable_per_gene <- fraction_tractable %>%
+  group_by(method, is_l1000, gene_id) %>%
+  summarize(fraction_tractable = sum(tractable)/n()) %>%
+  ungroup()
+
+fraction_tractable_per_condition <- fraction_tractable %>%
+  group_by(method, cell_line, drug, concentration, time) %>%
+  summarize(fraction_tractable = sum(tractable)/n()) %>%
+  ungroup()
+
+fraction_tractable_per_gene_density_scatter <- fraction_tractable_per_gene %>%
+  spread(method, fraction_tractable) %>%
+  split(.$is_l1000) %>%
+  imap(
+    function(df, gene_set) {
+      p <- density_2d_plot(
+        df,
+        aes(bulk, dge, color = density),
+        histogram_args = list(
+          breaks = seq(from = -.00001, to =1, length.out = 10),
+          closed = "right"
+        ),
+        scatter_elements = list(
+          coord_fixed(),
+          lims(x = c(0, 1), y = c(0, 1)),
+          labs(
+            x = "RNA-seq (fraction of conditions)",
+            y = "DGE (fraction of conditions)",
+            color = "Density of\ngenes",
+            title = gene_set
+          ),
+          scale_color_viridis_c()
+        ),
+        margin_elements = list(
+          lims(x = c(0, 1)),
+          labs(
+            x = NULL,
+            y = "Fraction\ngenes"
+          )
+        )
+      )
+      p
+    }
+  ) %>%
+  wrap_plots(ncol = 1)
+```
+
+Unfortunately, there are simply too few bulk RNA-seq conditions, can't quantify
+the proportion of conditions where gene is detectable in bulk RNA-seq.
+
+
+
 CMap data has been dowloaded from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE92742
 
 
 ```{r access_cmap_data}
-dir.create("cmap_overlap")
+library(webchem)
+
+dir.create("cmap_overlap", showWarnings = FALSE)
 cmap_path <- "~/data/DGE_comp/GSE92742_Broad_LINCS_Level5_COMPZ.MODZ_n473647x12328.gctx"
-instance_meta <- readr::read_tsv("~/data/DGE_comp/GSE92742_Broad_LINCS_inst_info.txt")
-gene_meta <- readr::read_tsv("~/data/DGE_comp/GSE92742_Broad_LINCS_gene_info.txt")
+instance_meta <- readr::read_tsv("~/data/DGE_comp/GSE92742_Broad_LINCS_inst_info.txt", na = "-666")
+gene_meta <- readr::read_tsv("~/data/DGE_comp/GSE92742_Broad_LINCS_gene_info.txt", na = "-666")
+pert_meta <- readr::read_tsv(
+  "~/data/DGE_comp/GSE92742_Broad_LINCS_pert_info.txt",
+  col_types = "ccclcccc", na = "-666"
+)
 
-instance_meta_trans <- instance_meta %>%
-  dplyr::mutate(drug = stringr::str_to_lower(pert_iname), cell_line = stringr::str_to_lower(cell_id))
+cmap_pubchem_ids <- instance_meta %>%
+  distinct(pert_id) %>%
+  left_join(pert_meta, by = "pert_id")
 
+cdk_pubchem_ids <- cdk_meta_combined %>%
+  distinct(drug) %>%
+  mutate(
+    pubchem_id = get_cid(str_to_lower(drug), from = "name") %>% unlist() %>% as.character()
+  )
 
 shared_conditions <- cdk_meta_combined %>%
-  dplyr::mutate_at(vars(drug, cell_line), stringr::str_to_lower) %>%
-  dplyr::left_join(instance_meta_trans, by = c("cell_line", "drug", "time" = "pert_time"))
+  left_join(cdk_pubchem_ids, by = "drug") %>%
+  left_join(cmap_pubchem_ids, by = c("pubchem_id" = "pubchem_cid"))
 
 shared_drugs <- shared_conditions %>%
   dplyr::group_by(cell_line, drug) %>%
@@ -238,21 +330,4 @@ ggsave(
 
 cmap_meta <- cmapR::read.gctx.meta(cmap_path, dimension = "row")
 
-```
-
-```{r fraction_tractable_deseq}
-deseq_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_control.rds"))
-
-fraction_tractable <- deseq_treatment_vs_control %>%
-  mutate(res_df = map(deseq_res, as.tibble, rownames = "gene_id")) %>%
-  select(method, cell_line, drug, concentration, time, res_df) %>%
-  unnest(res_df) %>%
-  mutate(
-    tractable = !is.na(padj),
-    is_l1000 = gene_id %in% l1000_ensembl_gene_ids
-  )
-
-p <- ggplot(fraction_tractable, aes(baseMean)) +
-  geom_histogram() +
-  facet_wrap(method~tractable, scales = "free")
 ```
