@@ -1,0 +1,33 @@
+---
+title: "Drug IDs"
+author: "Clemens Hug"
+date: "3/19/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+```
+
+
+## Fetching list of drug IDs from LINCS
+
+
+```{r lincs_drugs_ids}
+dp <- file.path("..", "raw_downloads")
+dir.create(dp, showWarnings = FALSE)
+download.file("http://lincsportal.ccs.miami.edu/dcic/api/download?path=LINCS_Data/Metadata/Small_Molecules/2018_02_20&file=CompoundTable_ExternalAnnotations_LSMIDs.txt", file.path(dp, "CompoundTable_ExternalAnnotations_LSMIDs.txt"))
+
+
+drug_ids_raw <- read_tsv(file.path(dp, "CompoundTable_ExternalAnnotations_LSMIDs.txt"))
+
+# Possible drug names are in a single column, separated by comma or semicolon
+# sometimes followed by whitespace
+drug_ids <- drug_ids_raw %>%
+  mutate(drug_name = str_split(SM_Name, pattern = "[,;] *")) %>%
+  select(drug_id = SM_LINCS_ID, drug_name) %>%
+  unnest(drug_name) %>%
+  distinct()
+
+write_csv(drug_ids, file.path("..", "wrangled", "lincs_drug_ids.csv"))
+```

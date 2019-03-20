@@ -1,0 +1,80 @@
+---
+title: "CMap data"
+author: "Clemens Hug"
+date: "3/19/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(cmapR)
+```
+
+## CMap data
+
+There are two big CMap datasets, Phase I and II with two different GEO accession
+numbers. Loading metadata and Z-score matrix from both.
+
+
+```{r perturbation_meta}
+pertubation_meta_raw <- list(
+  GSE92742 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_pert_info.txt.gz",
+  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_pert_info_2017-03-06.txt.gz"
+) %>%
+  map(read_tsv, na = "-666") %>%
+  bind_rows(.id = "dataset")
+
+pubchem_ids <- pertubation_meta_raw %>%
+  distinct(inchi_key) %>%
+  drop_na() %>%
+  mutate(pubchem_cid = get_cid(inchi_key, from = "inchikey", verbose = FALSE))
+
+pertubation_meta <- pertubation_meta_raw %>%
+  left_join(pubchem_ids, by = "inchi_key") %>%
+  # Some compounds in the original dataset already have pubchem ids, merging
+  # them with the fetched ones
+  mutate(
+    pubchem_cid = map2(
+      pubchem_cid.x, pubchem_cid.y,
+      ~unique(c(.x, .y)) %>%
+        # Remove NA values if there is a non-NA value
+        {if (sum(!is.na(.)) > 0) na.omit(.) else .}
+    )
+  ) %>%
+  select(-pubchem_cid.x, -pubchem_cid.y) %>%
+  unnest(pubchem_cid)
+
+write_csv(pertubation_meta, file.path("..", "wrangled", "cmap_perturbation_meta.csv.gz"))
+```
+
+
+
+```{r instance_meta}
+instance_meta_raw <- list(
+  GSE92742 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_inst_info.txt.gz",
+  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_inst_info_2017-03-06.txt.gz"
+) %>%
+  map(read_tsv, na = "-666") %>%
+  bind_rows(.id = "dataset")
+
+instance_meta <- instance_meta_raw %>%
+  left_join(select(pertubation_meta, pert_id, pubchem_cid), by = "pert_id")
+
+write_csv(instance_meta, file.path("..", "wrangled", "cmap_instance_meta.csv.gz"))
+```
+
+```{r signature_meta}
+signature_meta_raw <- list(
+  GSE92742 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_sig_info.txt.gz",
+  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_sig_info_2017-03-06.txt.gz"
+) %>%
+  map(read_tsv, na = "-666") %>%
+  bind_rows(.id = "dataset")
+# Parsing failures correspond to malformed fields in input data, are in irrelevant
+# signatures, so ignore...
+
+signature_meta <- signature_meta_raw %>%
+  left_join(select(pertubation_meta, pert_id, pubchem_cid), by = "pert_id")
+
+write_csv(signature_meta, file.path("..", "wrangled", "cmap_signature_meta.csv.gz"))
+```
