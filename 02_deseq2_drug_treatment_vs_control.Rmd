@@ -68,7 +68,11 @@ cdk_comps_meta <- cdk_meta_combined %>%
   # Bulding DESeq2 metadata for each condition
   mutate(
     sample_ids = map2(data, control, bind_rows) %>% map("sample_id"),
-    deseq_meta = map(sample_ids, ~filter(cdk_meta_deseq, sample_id %in% .x))
+    deseq_meta = map(
+      sample_ids,
+      ~filter(cdk_meta_deseq, sample_id %in% .x) %>%
+        select(sample_id, everything())
+    )
   )
 ```
 
@@ -78,34 +82,38 @@ cdk_comps_meta <- cdk_meta_combined %>%
 
 
 ```{r deseq_drugs_vs_control}
+library(pbapply)
 # Adding count matrices for each condition
 cdk_comps_inputs <- cdk_comps_meta %>%
   mutate(
-    counts = map(sample_ids, ~cdk_count_deseq[, .x])
+    counts = map(deseq_meta, ~cdk_count_deseq[, .x$sample_id] %>% as.matrix())
   )
 
-run_deseq_comp <- function(meta, counts, design=~drug) {
+run_deseq_comp <- function(meta, counts, design = ~drug) {
   library(tidyverse)
-  suppressMessages(
+  suppressWarnings(suppressMessages(
     DESeq2::DESeqDataSetFromMatrix(
       counts,
       meta,
       design = design
-    )
-  ) %>%
+    ) %>%
     DESeq2::DESeq()
+  ))
 }
 
-n_workers = 8
+n_workers = 10
 tryCatch({
-    compute_cluster <- parallel::makeCluster(n_workers, outfile = "deseq_worker.log")
+    # compute_cluster <- parallel::makeCluster(n_workers, outfile = "deseq_worker.log")
     cdk_deseq_res <- cdk_comps_inputs %>%
       mutate(
-        deseq = parallel::clusterMap(
-          compute_cluster,
+        deseq = pbapply::pbmapply(
+          # compute_cluster,
           run_deseq_comp,
           meta = deseq_meta,
-          counts = counts
+          counts = counts,
+          MoreArgs = list(design = ~drug),
+          SIMPLIFY = FALSE,
+          USE.NAMES = FALSE
         ),
         deseq_res = map(
           deseq,
@@ -114,8 +122,8 @@ tryCatch({
       )
   },
   finally = {
-    message("Stopped cluster")
-    parallel::stopCluster(compute_cluster)
+    # message("Stopped cluster")
+    # parallel::stopCluster(compute_cluster)
 })
 
 readr::write_rds(cdk_deseq_res, file.path("deseq", "deseq_treatment_vs_control.rds"))
