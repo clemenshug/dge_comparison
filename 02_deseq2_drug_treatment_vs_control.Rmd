@@ -71,7 +71,9 @@ cdk_comps_meta <- cdk_meta_combined %>%
     deseq_meta = map(
       sample_ids,
       ~filter(cdk_meta_deseq, sample_id %in% .x) %>%
-        select(sample_id, everything())
+        select(sample_id, everything()) %>%
+        # Move DMSO control to first factor level
+        mutate(drug = fct_relevel(drug, "DMSO"))
     )
   )
 ```
@@ -91,14 +93,14 @@ cdk_comps_inputs <- cdk_comps_meta %>%
 
 run_deseq_comp <- function(meta, counts, design = ~drug) {
   library(tidyverse)
-  suppressWarnings(suppressMessages(
+  suppressMessages(
     DESeq2::DESeqDataSetFromMatrix(
       counts,
       meta,
       design = design
     ) %>%
     DESeq2::DESeq()
-  ))
+  )
 }
 
 n_workers = 10
