@@ -10,6 +10,7 @@ library(tidyverse)
 library(cmapR)
 library(patchwork)
 library(egg)
+library(broom)
 
 paste_ <- function(...) {
   paste(..., sep = "_")
@@ -225,7 +226,8 @@ conditions. Genes that pass filter are "tractable" by DESeq2 for differential
 expression.
 
 ```{r fraction_tractable_deseq}
-deseq_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_control.rds"))
+deseq_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_control.rds")) %>%
+  mutate(comp_id = 1:n())
 
 fraction_tractable <- deseq_treatment_vs_control %>%
   mutate(res_df = map(deseq_res, as.tibble, rownames = "gene_id")) %>%
@@ -295,39 +297,272 @@ CMap data has been dowloaded from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi
 library(webchem)
 
 dir.create("cmap_overlap", showWarnings = FALSE)
-cmap_path <- "~/data/DGE_comp/GSE92742_Broad_LINCS_Level5_COMPZ.MODZ_n473647x12328.gctx"
-instance_meta <- readr::read_tsv("~/data/DGE_comp/GSE92742_Broad_LINCS_inst_info.txt", na = "-666")
-gene_meta <- readr::read_tsv("~/data/DGE_comp/GSE92742_Broad_LINCS_gene_info.txt", na = "-666")
-pert_meta <- readr::read_tsv(
-  "~/data/DGE_comp/GSE92742_Broad_LINCS_pert_info.txt",
-  col_types = "ccclcccc", na = "-666"
+cmap_paths <- list(
+  GSE92742 = "~/data/DGE_comp/GSE92742_Broad_LINCS_Level5_COMPZ.MODZ_n473647x12328.gctx",
+  GSE70138 = "~/data/DGE_comp/GSE70138_Broad_LINCS_Level5_COMPZ_n118050x12328_2017-03-06.gctx"
 )
 
-cmap_pubchem_ids <- instance_meta %>%
-  distinct(pert_id) %>%
-  left_join(pert_meta, by = "pert_id")
+signature_meta <- read_csv(file.path("wrangled", "cmap_signature_meta.csv.gz")) %>%
+  mutate(pubchem_cid = as.character(pubchem_cid))
 
-cdk_pubchem_ids <- cdk_meta_combined %>%
+gene_meta <- read_csv(file.path("wrangled", "cmap_gene_meta.csv.gz"))
+
+cdk_pubchem_ids <- deseq_treatment_vs_control %>%
   distinct(drug) %>%
   mutate(
     pubchem_id = get_cid(str_to_lower(drug), from = "name") %>% unlist() %>% as.character()
   )
 
-shared_conditions <- cdk_meta_combined %>%
-  left_join(cdk_pubchem_ids, by = "drug") %>%
-  left_join(cmap_pubchem_ids, by = c("pubchem_id" = "pubchem_cid"))
+# Fuzzy check if cell lines are called by the same name or slight variations
+cell_line_comp <- stringdist::stringdistmatrix(
+  cdk_meta_combined$cell_line %>% unique() %>% str_to_lower(),
+  signature_meta$cell_id %>% unique() %>% str_to_lower(),
+  useNames = "strings",
+  method = "osa"
+) %>%
+  as_tibble(rownames = "cdk") %>%
+  gather("cmap", "distance", -cdk) %>%
+  filter(distance <= 2)
 
-shared_drugs <- shared_conditions %>%
-  dplyr::group_by(cell_line, drug) %>%
-  dplyr::summarize(n_inst = sum(!is.na(inst_id))) %>%
-  dplyr::arrange(desc(n_inst))
+shared_conditions <- deseq_treatment_vs_control %>%
+  select(comp_id, method, cell_line, drug, concentration, time) %>%
+  inner_join(cdk_pubchem_ids, by = "drug") %>%
+  mutate(cell_line = str_to_lower(cell_line)) %>%
+  inner_join(
+    signature_meta %>% mutate(cell_id = str_to_lower(cell_id)),
+    by = c("pubchem_id" = "pubchem_cid", "cell_line" = "cell_id")
+  ) %>%
+  # Remove controls
+  filter(pert_iname != "DMSO") %>%
+  # Remove matches with concentration too different (<50%)
+  filter(abs(log10(concentration/pert_dose)) < 0.1760913) %>%
+  # Remove matches with time too different (<50%)
+  # All CDK data is 24h
+  filter(abs(log10(time/pert_time)) < 0.1760913) %>%
+  distinct()
+
+# How many unique signatures?
+unique_sigs <- shared_conditions %>%
+  dplyr::count(sig_id) %>%
+  dplyr::count(n)
+
+# Now that we have the IDs of the signatures we can fetch them from the
+# big GCTX matrix
+cmap_data <- shared_conditions %>%
+  group_by(dataset) %>%
+  do(
+    data = parse.gctx(cmap_paths[[.$dataset[[1]]]], cid = unique(.$sig_id))@mat %>%
+      as_tibble(rownames = "pr_gene_id") %>%
+      gather("sig_id", "z_score", -pr_gene_id)
+  ) %>%
+  ungroup() %>%
+  unnest(data) %>%
+  left_join(
+    gene_meta %>%
+      # Convert indicator variables to factor variable
+      # showing if gene is directly measured by l1000, computationally inferred
+      # with high fidelity (Best INFerred Genes "BING") or inferred with
+      # lower confidence
+      mutate(
+        cmap_measurement = case_when(
+          pr_is_lm == 1 ~ "landmark",
+          pr_is_bing == 1 ~ "inferred_high_fidelity",
+          TRUE ~ "inferred_low_fidelity"
+        )
+      ) %>%
+      select(pr_gene_id, symbol, cmap_measurement) %>%
+      mutate(pr_gene_id = as.character(pr_gene_id)),
+    by = "pr_gene_id"
+  )
+
+
+```
+
+```{r comparing_deseq_cmap_signatures}
+deseq_cmap_data <- shared_conditions %>%
+  select(comp_id, sig_id) %>%
+  left_join(deseq_treatment_vs_control, by = "comp_id") %>%
+  select(comp_id, sig_id, cell_line, drug, concentration, time, deseq_res) %>%
+  mutate(deseq_res = map(deseq_res, as_tibble, rownames = "ensembl_gene_id")) %>%
+  unnest(deseq_res) %>%
+  left_join(ensembl_gene_id_mapping, by = "ensembl_gene_id") %>%
+  left_join(cmap_data, by = c("sig_id", "symbol")) %>%
+  drop_na(log2FoldChange, z_score)
+```
+
+
+```{r deseq_cmap_scatter}
+deseq_cmap_scatter <- deseq_cmap_data %>%
+  mutate(condition = paste(cell_line, drug, concentration, time, sep = "_")) %>%
+  ggplot(aes(z_score, log2FoldChange)) +
+    # geom_hex() +
+  stat_density_2d(
+    aes(fill = log(stat(level))),
+    geom = "polygon"
+  ) +
+  facet_grid(condition ~ cmap_measurement) +
+  scale_fill_viridis_c()
 
 ggsave(
-  file.path("cmap_overlap", "shared_conditions_table.pdf"),
-  gridExtra::tableGrob(head(shared_drugs))
+  file.path("cmap_overlap", "cmap_zscore_vs_dge_l2fc_density.pdf"),
+  deseq_cmap_scatter,
+  width = 7, height = 10
 )
 
+deseq_cmap_cor_test <- deseq_cmap_data %>%
+  mutate(condition = paste(cell_line, drug, concentration, time, sep = "_")) %>%
+  group_by(condition, cmap_measurement) %>%
+  do(
+    test = cor.test(.$z_score, .$log2FoldChange, method = "kendall", conf.int = TRUE) %>% broom::tidy()
+  ) %>%
+  unnest(test) %>%
+  mutate(p.value = sprintf("%.4f", p.value))
 
-cmap_meta <- cmapR::read.gctx.meta(cmap_path, dimension = "row")
+```
+
+
+```{r deseq_cmap_fisher}
+def <- tibble(p.value = as.double(NA))
+deseq_cmap_fisher <- deseq_cmap_data %>%
+  mutate(condition = paste(cell_line, drug, concentration, time, sep = "_")) %>%
+  mutate(sig_deseq = padj < 0.05, sig_cmap = abs(z_score) > 1.96) %>%
+  group_by(condition, cmap_measurement) %>%
+  group_map(
+    ~tibble(
+      cont_table = list(table(.x[, c("sig_deseq", "sig_cmap")])),
+      n_sig_deseq = sum(.x$sig_deseq, na.rm = TRUE),
+      n_sig_cmap = sum(.x$sig_cmap, na.rm = TRUE)
+    )
+  ) %>%
+  mutate(
+    fisher_test = map(
+      cont_table,
+      ~possibly(fisher.test, NULL)(.x, conf.int = TRUE, conf.level = .95) %>%
+        {if (!is.null(.)) tidy(.) else tibble(p.value = NA)}
+    )
+  ) %>%
+  unnest(fisher_test) %>%
+  ungroup()
+
+deseq_cmap_fisher_table <- deseq_cmap_fisher %>%
+  arrange(
+    group_by(., condition) %>% mutate(p.value = min(p.value, na.rm = TRUE)) %>% pull(p.value),
+    condition,
+    cmap_measurement
+  ) %>%
+  select(condition, cmap_measurement, p.value, starts_with("n_sig")) %>%
+  mutate(p.value = sprintf("%.03g", p.value)) %>%
+  tableGrob(
+    theme = ttheme_default(
+      base_size = 10
+      # core = list(fg_params = list(hjust = 0, x = .05))
+    )
+  )
+ggsave(file.path("cmap_overlap", "cmap_overlap_fisher.pdf"), deseq_cmap_fisher_table, width = 7, height = 10)
+```
+
+
+Export DGE signatures as GMT files for analysis in CMAP
+
+```{r morpheus_cmap}
+gct_de_data <- deseq_treatment_vs_control %>%
+  select(method, cell_line, drug, concentration, time, deseq, deseq_res) %>%
+  mutate(
+    sample_id = paste_(method, cell_line, drug, concentration, time),
+    deseq_res = map2(
+      deseq, deseq_res,
+      ~.y %>%
+        as.data.frame() %>%
+        rownames_to_column("gene_id")
+    )
+  ) %>%
+  unnest(deseq_res)
+
+gene_ids_all_exp <- gct_de_data %>%
+  group_by(sample_id) %>%
+  summarize(gene_id_set = list(gene_id)) %>%
+  pull(gene_id_set) %>%
+  reduce(base::intersect) %>%
+  sort()
+
+gct_de_rdesc <- gene_meta %>%
+  drop_na(symbol) %>%
+  inner_join(ensembl_gene_id_mapping, by = "symbol") %>%
+  filter(ensembl_gene_id %in% gene_ids_all_exp) %>%
+  # Filter duplicate symbol/ensembl_id mappings, just 2
+  group_by(ensembl_gene_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  rename(id = ensembl_gene_id) %>%
+  arrange(id) 
+
+gct_de_cdesc <- deseq_treatment_vs_control %>%
+  select(method, cell_line, drug, concentration, time) %>%
+  mutate(id = paste_(method, cell_line, drug, concentration, time)) %>%
+  arrange(id)
+
+gct_de_data_mat <- gct_de_data %>%
+  select(sample_id, gene_id, log2FoldChange) %>%
+  filter(gene_id %in% gct_de_rdesc$id) %>%
+  arrange(gene_id, sample_id) %>%
+  spread(sample_id, log2FoldChange) %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+gct_de_gct <- new(
+  getClassDef("GCT", package = "cmapR"),
+  mat = gct_de_data_mat, rid = gct_de_rdesc$id, cid = gct_de_cdesc$id,
+  cdesc = as.data.frame(gct_de_cdesc), rdesc = as.data.frame(gct_de_rdesc)
+)
+
+cmapR::write.gct(
+  gct_de_gct,
+  file.path("cmap_overlap", "de_log2FC_unmoderated.gct")
+)
+```
+
+```{r cmap_query}
+de_cmap_sig <- deseq_treatment_vs_control %>%
+  select(method, cell_line, drug, concentration, time, deseq, deseq_res) %>%
+  mutate(
+    sample_id = paste_(method, cell_line, drug, concentration, time),
+    deseq_res = map2(
+      deseq, deseq_res,
+      ~.y %>%
+        as.data.frame() %>%
+        rownames_to_column("gene_id")
+    )
+  ) %>%
+  unnest(deseq_res) %>%
+  genebabel::join_hgnc("gene_id", "ensembl_gene_id", select_cols = "entrez_id") %>%
+  drop_na(entrez_id) %>%
+  filter(padj < 0.05) %>%
+  mutate(
+    direction = ifelse(log2FoldChange > 0, "up", "down")
+  ) %>%
+  group_by(sample_id, direction) %>%
+  filter(n() >= 11) %>%
+  arrange(padj) %>%
+  slice(1:min(150, n())) %>%
+  summarize(
+    gmt = list(list(head = sample_id[1], desc = sample_id[1], len = n(), entry = entrez_id))
+  )
+
+
+cmapR::write.gmt(de_cmap_sig$gmt, file.path("cmap_overlap", "de_gene_lists.gmt"))
+
+de_cmap_sig %>%
+  # Make sure we have up and down for each set, otherwise remove
+  group_by(sample_id) %>%
+  filter(n() == 2) %>%
+  ungroup() %>%
+  group_by(direction) %>%
+  group_nest() %>%
+  pwalk(
+    .,
+    function(direction, data) {
+      cmapR::write.gmt(data$gmt, file.path("cmap_overlap", paste0("de_gene_lists_", direction, ".gmt")))
+    }
+  )
 
 ```
