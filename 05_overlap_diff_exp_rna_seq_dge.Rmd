@@ -25,6 +25,35 @@ deseq_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_co
 ensembl_gene_id_mapping <- read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv"))
 ```
 
+
+Kartik uses a FDR cutoff of 0.2, use also for this analysis in order to make
+comparision with his gene lists easier.
+
+```{r cutoff}
+alpha_thresh <- 0.2
+
+# Rerun fetching the deseq results because we want to use alpha = .2
+deseq_treatment_vs_control_log_model <- deseq_treatment_vs_control_log_model %>%
+  mutate(
+    deseq_res = map(
+      deseq,
+      function(de) {
+        res <- DESeq2::results(de, alpha = alpha_thresh)
+      }
+    )
+  )
+deseq_treatment_vs_control <- deseq_treatment_vs_control %>%
+  mutate(
+    deseq_res = map(
+      deseq,
+      function(de) {
+        res <- DESeq2::results(de, alpha = alpha_thresh)
+      }
+    )
+  )
+```
+
+
 ```{r correlation}
 # Output kernel density estimates for each input point defined by vectors x, y
 # Adapted from grDevices::densCols to output densities instead of colors
@@ -94,9 +123,9 @@ dge_bulk_long_res <- function(deseq_res_df) {
     spread(method, padj) %>%
     mutate(
       significance = case_when(
-        bulk < 0.05 & dge < 0.05 ~ "both",
-        bulk < 0.05 ~ "bulk_only",
-        dge < 0.05 ~ "dge_only",
+        bulk < alpha_thresh & dge < alpha_thresh ~ "both",
+        bulk < alpha_thresh ~ "bulk_only",
+        dge < alpha_thresh ~ "dge_only",
         TRUE ~ "neither"
       ) %>%
         factor(levels = rev(c("both", "bulk_only", "dge_only", "neither")))
@@ -233,8 +262,8 @@ dge_bulk_venn_data_log_model <- deseq_treatment_vs_control_log_model %>%
   group_by(condition) %>%
   summarize(
     sign_genes = list(list(
-      dge = gene_id[dge < 0.05],
-      bulk = gene_id[bulk < 0.05]
+      dge = gene_id[dge < alpha_thresh],
+      bulk = gene_id[bulk < alpha_thresh]
     )),
     # Wrap in possibly because some conditions have no DE genes, crashes VennDiagram
     venn = list(possibly(venn_diagram, NULL)(sign_genes, main = condition[1]))
@@ -259,8 +288,8 @@ dge_bulk_venn_data <- deseq_treatment_vs_control %>%
   group_by(condition) %>%
   summarize(
     sign_genes = list(list(
-      dge = gene_id[dge < 0.05],
-      bulk = gene_id[bulk < 0.05]
+      dge = gene_id[dge < alpha_thresh],
+      bulk = gene_id[bulk < alpha_thresh]
     )),
     # Wrap in possibly because some conditions have no DE genes, crashes VennDiagram
     venn = list(possibly(venn_diagram, NULL)(sign_genes, main = condition[1]))
@@ -275,8 +304,6 @@ ggsave(
   dge_bulk_venn_plot, width = 7, height = 2.7
 )
 
-x <- venn_diagram(dge_bulk_venn_plot_log_model$sign_genes[[5]])
-grid::grid.draw(x)
 ```
 
 
@@ -301,23 +328,25 @@ dge_bulk_kartik_venn_data <- deseq_treatment_vs_control %>%
     condition = paste(cell_line, drug, paste0(concentration, "µM"), paste0(time, "h"), sep = " ")
   ) %>%
   dge_bulk_long_res() %>%
-  filter(var == "padj") %>%
-  drop_na(bulk, dge) %>%
-  group_by(condition) %>%
+  gather(key = "assay", value = "val", bulk, dge) %>%
+  filter(var %in% c("log2FoldChange", "padj")) %>%
+  spread(var, val) %>%
+  drop_na() %>%
+  group_by(condition, assay) %>%
   summarize(
-    sign_genes = list(list(
-        dge = gene_id[dge < 0.05],
-        bulk = gene_id[bulk < 0.05]
-    ))
+    sign_genes = list(gene_id[log2FoldChange < 0 & padj < alpha_thresh])
   ) %>%
+  group_by(condition) %>%
+  summarize(sign_genes = list(set_names(sign_genes, assay))) %>%
+  ungroup() %>%
   crossing(kartik_lists) %>%
   mutate(
     # Wrap in possibly because some conditions have no DE genes, crashes VennDiagram
     venn = pmap(
       .,
       function(sign_genes, gene_id, condition, kartik_list, ...) {
-        x <- set_names(list(gene_id), kartik_list)
-        possibly(venn_diagram, NULL)(c(sign_genes, x), main = condition, margin = 0)
+        gene_lists <- c(sign_genes, set_names(list(gene_id), kartik_list))
+        possibly(venn_diagram, NULL)(gene_lists, main = condition, margin = 0)
       }
     )
   )
@@ -326,6 +355,29 @@ dge_bulk_kartik_venn_plot <- dge_bulk_kartik_venn_data %>%
   arrange(kartik_list, condition) %>%
   pull(venn) %>%
   map(grid::grobTree, vp = grid::viewport(width = unit(.85, "snpc"), height = unit(.9, "snpc"))) %>%
+  patchwork::wrap_plots()
+ggsave(
+  file.path("overlap_de", "dge_bulk_kartik_venn.png"),
+  dge_bulk_kartik_venn_plot, width = 8, height = 6
+)
+
+dge_bulk_kartik_upset_plot <- dge_bulk_kartik_venn_data %>%
+  arrange(kartik_list, condition) %>%
+  mutate(
+    # Wrap in possibly because some conditions have no DE genes, crashes VennDiagram
+    venn = pmap(
+      .,
+      function(sign_genes, gene_id, condition, kartik_list, ...) {
+        gene_lists <- c(sign_genes, set_names(list(gene_id), kartik_list)) %>%
+          UpSetR::fromList()
+        grid::grid.grabExpr(
+          print(UpSetR::upset(gene_lists))
+        )
+      }
+    )
+  ) %>%
+  pull(venn) 
+%>%
   patchwork::wrap_plots()
 ggsave(
   file.path("overlap_de", "dge_bulk_kartik_venn.png"),
