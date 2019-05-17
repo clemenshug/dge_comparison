@@ -22,6 +22,7 @@ Compare significantly differential expressed genes between RNA-seq and DGE.
 ```{r loading}
 deseq_treatment_vs_control_log_model <- read_rds(file.path("deseq", "deseq_treatment_vs_control_log_model.rds"))
 deseq_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_control.rds"))
+ensembl_gene_id_mapping <- read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv"))
 ```
 
 ```{r correlation}
@@ -200,7 +201,7 @@ ggsave(
 
 
 ```{r venn_diagrams}
-venn_diagram <- function(sets, cmap = "Set2", ...) {
+venn_diagram <- function(sets, cmap = "Set2", margin = .1, alpha = .4, ...) {
   n <- length(sets)
   fill_cols <- RColorBrewer::brewer.pal(max(3, n), cmap)[1:n]
   outer_cols <- colorspace::darken(fill_cols, amount = .1)
@@ -216,13 +217,13 @@ venn_diagram <- function(sets, cmap = "Set2", ...) {
     # main.fontface = "bold",
     # cat.cex = 2,
     # cex = 2,
-    margin = .1,
-    alpha = .4,
+    margin = margin,
+    alpha = alpha,
     ...
   )
 }
 
-dge_bulk_venn_plot_log_model <- deseq_treatment_vs_control_log_model %>%
+dge_bulk_venn_data_log_model <- deseq_treatment_vs_control_log_model %>%
   mutate(
     condition = paste(cell_line, drug, paste0(time, "h"), sep = " ")
   ) %>%
@@ -237,7 +238,9 @@ dge_bulk_venn_plot_log_model <- deseq_treatment_vs_control_log_model %>%
     )),
     # Wrap in possibly because some conditions have no DE genes, crashes VennDiagram
     venn = list(possibly(venn_diagram, NULL)(sign_genes, main = condition[1]))
-  ) %>%
+  )
+
+dge_bulk_venn_plot_log_model <- dge_bulk_venn_data_log_model %>%
   pull(venn) %>%
   map(grid::grobTree) %>%
   patchwork::wrap_plots()
@@ -246,7 +249,7 @@ ggsave(
   dge_bulk_venn_plot_log_model, width = 8, height = 7
 )
 
-dge_bulk_venn_plot <- deseq_treatment_vs_control %>%
+dge_bulk_venn_data <- deseq_treatment_vs_control %>%
   mutate(
     condition = paste(cell_line, drug, paste0(concentration, "µM"), paste0(time, "h"), sep = " ")
   ) %>%
@@ -261,7 +264,9 @@ dge_bulk_venn_plot <- deseq_treatment_vs_control %>%
     )),
     # Wrap in possibly because some conditions have no DE genes, crashes VennDiagram
     venn = list(possibly(venn_diagram, NULL)(sign_genes, main = condition[1]))
-  ) %>%
+  )
+
+dge_bulk_venn_plot <- dge_bulk_venn_data %>%
   pull(venn) %>%
   map(grid::grobTree) %>%
   patchwork::wrap_plots()
@@ -272,6 +277,61 @@ ggsave(
 
 x <- venn_diagram(dge_bulk_venn_plot_log_model$sign_genes[[5]])
 grid::grid.draw(x)
+```
+
+
+Compare results of differential gene expression drug treatment vs control with
+the results Kartik has gotten using bulk RNA-seq.
+
+1. Intersection of genes down in Palbociclib, Abemaciclib and Ribociclib.
+2. Genes down only in Abemaciclib.
+
+```{r overlap_kartik_gene_lists}
+kartik_lists <- list(
+  dn_all = read_lines(file.path("kartik", "fig3_rnaseq_acute_clustergram_genes_all_dn.tsv")),
+  dn_abema = read_lines(file.path("kartik", "fig3_rnaseq_acute_clustergram_genes_abema_dn.tsv"))
+) %>%
+  map(genebabel::query_hgnc, match_cols = c("symbol", "alias_symbol", "prev_symbol")) %>%
+  map(filter, ensembl_gene_id %in% rownames(deseq_treatment_vs_control_log_model$counts[[1]])) %>%
+  map("ensembl_gene_id") %>%
+  enframe("kartik_list", "gene_id")
+
+dge_bulk_kartik_venn_data <- deseq_treatment_vs_control %>%
+  mutate(
+    condition = paste(cell_line, drug, paste0(concentration, "µM"), paste0(time, "h"), sep = " ")
+  ) %>%
+  dge_bulk_long_res() %>%
+  filter(var == "padj") %>%
+  drop_na(bulk, dge) %>%
+  group_by(condition) %>%
+  summarize(
+    sign_genes = list(list(
+        dge = gene_id[dge < 0.05],
+        bulk = gene_id[bulk < 0.05]
+    ))
+  ) %>%
+  crossing(kartik_lists) %>%
+  mutate(
+    # Wrap in possibly because some conditions have no DE genes, crashes VennDiagram
+    venn = pmap(
+      .,
+      function(sign_genes, gene_id, condition, kartik_list, ...) {
+        x <- set_names(list(gene_id), kartik_list)
+        possibly(venn_diagram, NULL)(c(sign_genes, x), main = condition, margin = 0)
+      }
+    )
+  )
+
+dge_bulk_kartik_venn_plot <- dge_bulk_kartik_venn_data %>%
+  arrange(kartik_list, condition) %>%
+  pull(venn) %>%
+  map(grid::grobTree, vp = grid::viewport(width = unit(.85, "snpc"), height = unit(.9, "snpc"))) %>%
+  patchwork::wrap_plots()
+ggsave(
+  file.path("overlap_de", "dge_bulk_kartik_venn.png"),
+  dge_bulk_kartik_venn_plot, width = 8, height = 6
+)
+
 ```
 
 
