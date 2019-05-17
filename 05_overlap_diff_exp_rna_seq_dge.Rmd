@@ -1,0 +1,308 @@
+---
+title: "Overlap differential expression RNA-seq and DGE"
+author: "Clemens Hug"
+date: "4/29/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+
+paste_ <- function(...) {
+  paste(..., sep = "_")
+}
+
+theme_set(theme_minimal())
+```
+
+# Goal
+
+Compare significantly differential expressed genes between RNA-seq and DGE.
+
+```{r loading}
+deseq_treatment_vs_control_log_model <- read_rds(file.path("deseq", "deseq_treatment_vs_control_log_model.rds"))
+deseq_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_control.rds"))
+```
+
+```{r correlation}
+# Output kernel density estimates for each input point defined by vectors x, y
+# Adapted from grDevices::densCols to output densities instead of colors
+density_2d <- function (x, y = NULL, nbin = 128, bandwidth) {
+  xy <- xy.coords(x, y, setLab = FALSE)
+  select <- is.finite(xy$x) & is.finite(xy$y)
+  x <- cbind(xy$x, xy$y)[select, ]
+  map <- grDevices:::.smoothScatterCalcDensity(x, nbin, bandwidth)
+  mkBreaks <- function(u) u - diff(range(u))/(length(u) - 1)/2
+  xbin <- cut(x[, 1], mkBreaks(map$x1), labels = FALSE)
+  ybin <- cut(x[, 2], mkBreaks(map$x2), labels = FALSE)
+  dens <- map$fhat[cbind(xbin, ybin)]
+  dens[is.na(dens)] <- 0
+  dens
+}
+
+density_2d_plot <- function (
+  data, aesthetics,
+  histogram_args = list(bins = 10), scatter_elements = list(), margin_elements = list()
+) {
+  marginals <- aesthetics[c("x", "y")] %>%
+    imap(
+      function (axis_var, axis) {
+        p <- ggplot(data, aes(!!axis_var)) +
+          rlang::exec(
+            geom_histogram,
+            aes(y = stat(count)/sum(stat(count))),
+            !!!histogram_args
+          ) +
+          geom_step(aes(y = stat(y)), stat = "ecdf") +
+          margin_elements
+        if (axis == "y") p <- p + scale_y_reverse() + coord_flip()
+        p
+      }
+    )
+  density_data <- data %>%
+    mutate(density = density_2d(!!aesthetics$x, !!aesthetics$y)) 
+  # %>%
+    # arrange(density)
+  p <- ggplot(density_data, aesthetics) +
+    geom_point() +
+    scatter_elements
+  invisible(egg::ggarrange(
+    plots = list(
+      ggplot() + theme_void(),
+      marginals$x,
+      marginals$y,
+      p
+    ),
+    widths = c(1, 4),
+    heights = c(1, 3)
+  ))
+}
+
+dge_bulk_long_res <- function(deseq_res_df) {
+  dge_bulk_res <- deseq_res_df %>%
+    select(method, condition, deseq_res) %>%
+    # Remove conditions without matching dge + bulk
+    group_by(condition) %>%
+    filter(length(unique(method)) == 2) %>%
+    ungroup() %>%
+    mutate(deseq_res = map(deseq_res, as_tibble, rownames = "gene_id")) %>%
+    unnest(deseq_res)
+
+  dge_bulk_sign <- dge_bulk_res %>%
+    select(method, condition, gene_id, padj) %>%
+    spread(method, padj) %>%
+    mutate(
+      significance = case_when(
+        bulk < 0.05 & dge < 0.05 ~ "both",
+        bulk < 0.05 ~ "bulk_only",
+        dge < 0.05 ~ "dge_only",
+        TRUE ~ "neither"
+      ) %>%
+        factor(levels = rev(c("both", "bulk_only", "dge_only", "neither")))
+    ) %>%
+    select(condition, gene_id, significance)
+  
+  dge_bulk_long_res <- dge_bulk_res %>%
+    gather("var", "value", -method, -gene_id, -condition) %>%
+    spread(method, value) %>%
+    left_join(dge_bulk_sign, by = c("condition", "gene_id")) %>%
+    arrange(significance)
+  dge_bulk_long_res
+}
+
+dge_bulk_res_cor_plot <- function(deseq_res_df) {
+  dge_bulk_corr_plot <- deseq_res_df %>%
+    filter(var == "log2FoldChange") %>%
+    drop_na(bulk, dge) %>%
+    ggplot(aes(bulk, dge)) +
+      geom_point(aes(color = significance), shape = 16) +
+      facet_wrap(vars(condition)) +
+      # scale_fill_viridis_c(trans = "log10") +
+      coord_fixed() +
+      scale_color_manual(
+        values = c(
+          dge_only = "#66c2a5",
+          bulk_only = "#8da0cb",
+          both = "#fc8d62",
+          neither = "grey80"
+        ) %>%
+          map_chr(grDevices::adjustcolor, alpha.f = .7)
+      ) +
+      # lims(x = c(-1.5, 1.5), y = c(-1.5, 1.5)) +
+      labs(x = "log2 fold change RNA-seq", y = "log2 fold change DGE", color = "Significant\nFDR < .05")
+
+  dge_bulk_corr_plot
+}
+
+dge_bulk_corr_plot_log_model <- dge_bulk_res_cor_plot(
+  deseq_treatment_vs_control_log_model %>%
+    mutate(
+      condition = paste(cell_line, drug, paste0(time, " h"), sep = " ")
+    ) %>%
+    dge_bulk_long_res()
+)
+
+dge_bulk_corr_plot <- dge_bulk_res_cor_plot(
+  deseq_treatment_vs_control %>%
+    mutate(
+      condition = paste(cell_line, drug, paste0(concentration, " µM"), paste0(time, " h"), sep = " ")
+    ) %>%
+    dge_bulk_long_res()
+)
+
+dir.create("overlap_de") 
+ggsave(
+  file.path("overlap_de", "dge_bulk_corr_plot.png"),
+  dge_bulk_corr_plot,
+  width = 9, height = 2.5
+)
+ggsave(
+  file.path("overlap_de", "dge_bulk_corr_plot_log_model.png"),
+  dge_bulk_corr_plot_log_model,
+  width = 9, height = 5
+)
+# dge_bulk_corr_plots <- dge_bulk_long_res %>%
+#   filter(var == "log2FoldChange") %>%
+#   drop_na(bulk, dge) %>%
+#   group_by(condition) %>%
+#   arrange(significance, .by_group = TRUE) %>%
+#   group_map(
+#     function(df, g) {
+#       p <- density_2d_plot(
+#         df, aes(bulk, dge, color = significance),
+#         histogram_args = list(bins = 20),
+#         scatter_elements = list(
+#           coord_fixed(),
+#           scale_color_manual(
+#             values = c(
+#               dge_only = "#66c2a5",
+#               bulk_only = "#8da0cb",
+#               both = "#fc8d62",
+#               neither = "grey80"
+#             ) %>%
+#               map_chr(grDevices::adjustcolor, alpha.f = .5)
+#           ),
+#           # scale_color_viridis_c(trans = "log10"),
+#           lims(x = c(-1.5, 1.5), y = c(-1.5, 1.5)),
+#           labs(x = "log2 fold change RNA-seq", y = "log2 fold change DGE", color = "Significant")
+#           # geom_smooth(method = "lm", formula = y ~ x)
+#         ),
+#         margin_elements = list(
+#           lims(x = c(-1.5, 1.5)),
+#           labs(x = NULL, y = "Density")
+#         )
+#       )
+#       tibble(plot = list(p))
+#     }
+#   )
+
+```
+
+
+```{r venn_diagrams}
+venn_diagram <- function(sets, cmap = "Set2", ...) {
+  n <- length(sets)
+  fill_cols <- RColorBrewer::brewer.pal(max(3, n), cmap)[1:n]
+  outer_cols <- colorspace::darken(fill_cols, amount = .1)
+  VennDiagram::venn.diagram(
+    sets,
+    NULL,
+    fill = fill_cols,
+    col = outer_cols,
+    fontfamily = "Helvetica",
+    cat.fontfamily = "Helvetica",
+    # cat.fontface = "bold",
+    main.fontfamily = "Helvetica",
+    # main.fontface = "bold",
+    # cat.cex = 2,
+    # cex = 2,
+    margin = .1,
+    alpha = .4,
+    ...
+  )
+}
+
+dge_bulk_venn_plot_log_model <- deseq_treatment_vs_control_log_model %>%
+  mutate(
+    condition = paste(cell_line, drug, paste0(time, "h"), sep = " ")
+  ) %>%
+  dge_bulk_long_res() %>%
+  filter(var == "padj") %>%
+  drop_na(bulk, dge) %>%
+  group_by(condition) %>%
+  summarize(
+    sign_genes = list(list(
+      dge = gene_id[dge < 0.05],
+      bulk = gene_id[bulk < 0.05]
+    )),
+    # Wrap in possibly because some conditions have no DE genes, crashes VennDiagram
+    venn = list(possibly(venn_diagram, NULL)(sign_genes, main = condition[1]))
+  ) %>%
+  pull(venn) %>%
+  map(grid::grobTree) %>%
+  patchwork::wrap_plots()
+ggsave(
+  file.path("overlap_de", "dge_bulk_venn_log_model.png"),
+  dge_bulk_venn_plot_log_model, width = 8, height = 7
+)
+
+dge_bulk_venn_plot <- deseq_treatment_vs_control %>%
+  mutate(
+    condition = paste(cell_line, drug, paste0(concentration, "µM"), paste0(time, "h"), sep = " ")
+  ) %>%
+  dge_bulk_long_res() %>%
+  filter(var == "padj") %>%
+  drop_na(bulk, dge) %>%
+  group_by(condition) %>%
+  summarize(
+    sign_genes = list(list(
+      dge = gene_id[dge < 0.05],
+      bulk = gene_id[bulk < 0.05]
+    )),
+    # Wrap in possibly because some conditions have no DE genes, crashes VennDiagram
+    venn = list(possibly(venn_diagram, NULL)(sign_genes, main = condition[1]))
+  ) %>%
+  pull(venn) %>%
+  map(grid::grobTree) %>%
+  patchwork::wrap_plots()
+ggsave(
+  file.path("overlap_de", "dge_bulk_venn.png"),
+  dge_bulk_venn_plot, width = 7, height = 2.7
+)
+
+x <- venn_diagram(dge_bulk_venn_plot_log_model$sign_genes[[5]])
+grid::grid.draw(x)
+```
+
+
+```{r jaccard}
+
+
+matched_comp_p <- deseq_treatment_vs_control %>%
+  mutate(
+    deseq_res = map(deseq_res, as_tibble, rownames = "gene_id")
+  ) %>%
+  unnest(deseq_res) %>%
+  select(method, cell_line, drug, concentration, time, gene_id, padj) %>%
+  spread(method, padj) %>%
+  drop_na(bulk, dge)
+
+matched_comp_jaccard <- matched_comp_p %>%
+  group_by(cell_line, drug, concentration, time) %>%
+  summarize(jaccard = list(jaccard::jaccard.test(dge < 0.05, bulk < 0.05, method = "exact")))
+
+%>%
+  mutate(
+    overlap = case_when(
+      bulk < 0.05 & dge < 0.05 ~ "both",
+      bulk < 0.05 ~ "bulk_only",
+      dge < 0.05 ~ "dge_only",
+      TRUE ~ "neither"
+    )
+  ) %>%
+  group_by(cell_line, drug, concentration, time, overlap) %>%
+  summarize(count = n()) %>%
+  ungroup()
+
+
+```
