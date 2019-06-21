@@ -1,0 +1,101 @@
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(biomaRt)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("~/data/DGE_comp/")
+syn_csv <- function(synid, ...) {
+  syn(synid) %>%
+    readr::read_csv(...)
+}
+syn_tsv <- function(synid, ...) {
+  syn(synid) %>%
+    readr::read_tsv(...)
+}
+paste_ <- function(...) {
+  paste(..., sep = "_")
+}
+```
+
+## Goal
+
+Load and process RNA-seq counts from the AD project by Steven Rodriguez and
+Artem Sokolov.
+
+## Preprocessed
+
+The DGE and bulk RNA-seq data was already aligned and preprocessed.
+
+```{r loading_counts}
+# Load Artem's script for filtering the DGE experiments by sequencing depth
+# filterWells
+source("https://raw.githubusercontent.com/ArtemSokolov/amp-ad/3ffb9ff24058ea86bd9b10572089fc41823f3541/wrangle/DGE/dfexp.R")
+
+# Exclude DGE experiments with total read count lower than this
+count_thresholds <- list(
+  dge1 = 3e4,
+  dge2 = 8.5e4
+)
+
+counts_raw <- list(
+  dge1 = "syn18145755",
+  dge2 = "syn17115624"
+) %>%
+  map(syn) %>%
+  map(read_csv)
+
+meta <- list(
+  dge1 = "syn15673460",
+  dge2 = "syn17115625"
+) %>%
+  map(syn) %>%
+  map(read_csv) %>%
+  imap(~filterWells(.x, counts_raw[[.y]], count_thresholds[[.y]])) %>%
+  bind_rows(.id = "batch") %>%
+  # DMSO control is called `drug control` in DGE1
+  mutate(Drug = str_to_lower(Drug) %>% recode(`drug control` = "dmso")) %>%
+  mutate(
+    sample_id = paste("ad", batch, Well, sep = "_"),
+    time = 24L,
+    experiment = "ad"
+    # drug_id = ifelse(Drug == "dmso", "dmso", drug_id)
+  ) %>%
+  rename_all(str_to_lower)
+
+counts_long <- counts_raw %>%
+  bind_rows(.id = "batch") %>%
+  dplyr::rename(gene_id = HUGO) %>%
+  gather(Well, count, -batch, -gene_id) %>%
+  mutate(
+    sample_id = paste("ad", batch, Well, sep = "_"),
+    experiment = "ad"
+  ) %>%
+  filter(sample_id %in% meta$sample_id)
+
+```
+
+
+```{r map_gene_ids}
+library(genebabel)
+hgnc_map <- query_hgnc(query = unique(counts_long$gene_id), c("symbol", "alias_symbol", "prev_symbol")) %>%
+  dplyr::select(query, symbol)
+
+count(hgnc_map, query) %>% count(n)
+
+counts_long_mapped <- counts_long %>%
+  left_join(hgnc_map, by = c("gene_id" = "query")) %>%
+  dplyr::select(-gene_id) %>%
+  drop_na(symbol)
+```
+
+
+```{r writing_data_disk}
+ad_dir <- file.path("..", "wrangled", "ad")
+dir.create(ad_dir, showWarnings = FALSE)
+
+readr::write_csv(meta, file.path(ad_dir, "meta.csv"))
+readr::write_csv(counts_long_mapped, file.path(ad_dir, "counts.csv.gz"))
+
+```
