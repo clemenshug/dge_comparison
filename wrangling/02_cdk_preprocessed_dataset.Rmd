@@ -111,25 +111,6 @@ cdk_bulk_counts <- list(
   dplyr::filter(id != "Sum", sample_id %in% cdk_bulk_meta$sample_id) %>%
   dplyr::rename(ensembl_gene_id = id)
 
-cdk_dge_sample_counts <- cdk_dge_counts %>%
-  dplyr::group_by(sample_id) %>%
-  dplyr::summarize(count = sum(count)) %>%
-  dplyr::arrange(count)
-
-cdk_dge_sample_counts_plot <- cdk_dge_sample_counts %>%
-  dplyr::mutate(sample_id = factor(sample_id, levels = unique(sample_id))) %>% 
-  ggplot(aes(sample_id, count)) +
-  geom_col()
-
-cdk_bulk_sample_counts <- cdk_bulk_counts %>%
-  dplyr::group_by(sample_id) %>%
-  dplyr::summarize(count = sum(count)) %>%
-  dplyr::arrange(count)
-
-cdk_bulk_sample_counts_plot <- cdk_bulk_sample_counts %>%
-  dplyr::mutate(sample_id = factor(sample_id, levels = unique(sample_id))) %>% 
-  ggplot(aes(sample_id, count)) +
-  geom_col()
 ```
 
 ## Match IDs from DGE and bulk
@@ -143,41 +124,31 @@ cdk_common_ids <- base::intersect(
   cdk_bulk_counts$ensembl_gene_id
 )
 
-hsap <- biomaRt::useMart("ENSEMBL_MART_ENSEMBL", "hsapiens_gene_ensembl")
-
-ensembl_gene_id_mart <- biomaRt::getBM(
-  attributes = c("hgnc_symbol", "ensembl_gene_id"),
-  filters = "ensembl_gene_id",
-  values = union(cdk_dge_counts$ensembl_gene_id, cdk_bulk_counts$ensembl_gene_id),
-  mart = hsap
+ensembl_gene_id_mapping_hgnc <- genebabel::query_hgnc(
+  base::union(cdk_dge_counts$ensembl_gene_id, cdk_bulk_counts$ensembl_gene_id), c("ensembl_gene_id")
 ) %>%
-  dplyr::rename(symbol = hgnc_symbol)
+  dplyr::select(ensembl_gene_id = query, symbol) %>%
+  # ENSG00000230417 maps to two symbols, excluding from analysis
+  # Excluding any ensembl ids that map to multiple HGNC symbols from analysis
+  group_by(ensembl_gene_id) %>%
+  summarize(symbol = if (n() == 1) symbol else NA_character_)
 
-ensembl_gene_id_mart %>%
-  dplyr::count(ensembl_gene_id) %>%
-  dplyr::count(n)
-# Two ensembl_gene_ids map to multiple HUGO symbols, setting those NA...
-# Also there are some ensembl_gene_ids that are in the biomart DB, but that
-# map to empty "" symbols. Setting those to NA as well.
-ensembl_gene_id_mapping <- ensembl_gene_id_mart %>%
-  dplyr::group_by(ensembl_gene_id) %>%
-  dplyr::summarize(symbol = if (n() > 1) as.character(NA) else symbol) %>%
-  dplyr::ungroup() %>%
-  dplyr::mutate(symbol = ifelse(symbol == "", as.character(NA), symbol))
-ensembl_gene_id_mapping %>%
+ensembl_gene_id_mapping_hgnc %>%
   dplyr::count(ensembl_gene_id) %>%
   dplyr::count(n)
 # Good now, no duplicates
 
-all(cdk_common_ids %in% ensembl_gene_id_mapping$ensembl_gene_id)
+all(cdk_common_ids %in% ensembl_gene_id_mapping_hgnc$ensembl_gene_id)
 # TRUE
-# All ensembl IDs are present in the biomart df!
 
 cdk_bulk_counts <- cdk_bulk_counts %>%
-  dplyr::left_join(ensembl_gene_id_mapping, by = "ensembl_gene_id")
+  dplyr::left_join(ensembl_gene_id_mapping_hgnc, by = "ensembl_gene_id") %>%
+  tidyr::drop_na(symbol)
 cdk_dge_counts <- cdk_dge_counts %>%
-  dplyr::left_join(ensembl_gene_id_mapping, by = "ensembl_gene_id")
+  dplyr::left_join(ensembl_gene_id_mapping_hgnc, by = "ensembl_gene_id") %>%
+  tidyr::drop_na(symbol)
 
+  
 library(VennDiagram)
 
 vd <- VennDiagram::venn.diagram(
@@ -244,16 +215,19 @@ cdk_count_combined <- list(
 
 
 ```{r writing_data_disk}
-readr::write_csv(cdk_bulk_meta, file.path("..", "wrangled", "cdk_bulk_meta.csv"))
-readr::write_csv(cdk_bulk_counts, file.path("..", "wrangled", "cdk_bulk_counts.csv.gz"))
+cdk_dir <- file.path("..", "wrangled", "cdk")
+dir.create(cdk_dir, showWarnings = FALSE)
 
-readr::write_csv(cdk_dge_meta, file.path("..", "wrangled", "cdk_dge_meta.csv"))
-readr::write_csv(cdk_dge_counts, file.path("..", "wrangled", "cdk_dge_counts.csv.gz"))
+readr::write_csv(cdk_bulk_meta, file.path(cdk_dir, "cdk_bulk_meta.csv"))
+readr::write_csv(cdk_bulk_counts, file.path(cdk_dir, "cdk_bulk_counts.csv.gz"))
 
-readr::write_csv(cdk_meta_combined, file.path("..", "wrangled", "cdk_meta_combined.csv"))
-readr::write_csv(cdk_count_combined, file.path("..", "wrangled", "cdk_count_combined.csv.gz"))
+readr::write_csv(cdk_dge_meta, file.path(cdk_dir, "cdk_dge_meta.csv"))
+readr::write_csv(cdk_dge_counts, file.path(cdk_dir, "cdk_dge_counts.csv.gz"))
 
-readr::write_rds(matched_samples, file.path("..", "wrangled", "cdk_meta_matched_samples.rds"))
+readr::write_csv(cdk_meta_combined, file.path(cdk_dir, "meta.csv"))
+readr::write_csv(cdk_count_combined, file.path(cdk_dir, "counts.csv.gz"))
 
-readr::write_csv(ensembl_gene_id_mapping, file.path("..", "wrangled", "ensembl_gene_id_mapping.csv"))
+readr::write_rds(matched_samples, file.path(cdk_dir, "cdk_meta_matched_samples.rds"))
+
+readr::write_csv(ensembl_gene_id_mapping_hgnc, file.path(cdk_dir, "ensembl_gene_id_mapping.csv"))
 ```
