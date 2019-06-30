@@ -19,26 +19,55 @@ paste_ <- function(...) {
 Calculating differentially expressed genes between drug treatment conditions
 and control for DGE and bulk RNA-seq separately.
 
-```{r loading}
-cdk_meta_combined <- readr::read_csv(file.path("wrangled", "cdk_meta_combined.csv"))
-cdk_count_combined <- readr::read_csv(file.path("wrangled", "cdk_count_combined.csv.gz"), col_types = "ccicc")
+```{r read_data}
+data_sets <- tibble(name = c("cdk", "ad"))
 
-ensembl_gene_id_mapping <- readr::read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv"))
+data_sets <- data_sets %>%
+  mutate(
+    meta = map(name, ~read_csv(file.path("wrangled", .x, "meta.csv"))),
+    counts = map(name, ~read_csv(file.path("wrangled", .x, "counts.csv.gz")))
+  )
+```
 
-cdk_meta_deseq <- cdk_meta_combined %>%
+# QC filter samples
+
+```{r filter_samples}
+total_counts <- data_sets %>%
+  mutate(
+    totals = map(counts, ~.x %>% group_by(sample_id) %>% summarize(total = sum(count)))
+  ) %>%
+  unnest(totals) %>%
+  left_join(bind_rows(data_sets$meta), by = "sample_id")
+
+total_counts_plot <- total_counts %>%
+  ggplot(aes(x = method, y = total)) +
+    ggbeeswarm::geom_quasirandom() +
+    scale_y_log10() +
+    facet_wrap(~name)
+
+# Two samples with < 2Mio bulk counts, removing those, big outliers
+
+passing_ids <- total_counts %>%
+  filter(ifelse(method == "bulk", total > 2e6, TRUE)) %>%
+  pull(sample_id)
+
+meta_passing <- unnest(data_sets, meta) %>%
   # Generate unique id for each combination of exp parameters
-  dplyr::mutate(condition = paste_(method, cell_line, drug, concentration, time)) %>%
-  as.data.frame() %>%
-  `rownames<-`(.$sample_id)
+  dplyr::mutate(condition = paste_(method, if (exists("cell_line")) cell_line else NULL, drug, concentration, time)) %>%
+  filter(sample_id %in% passing_ids) %>%
+  mutate(drug = recode(drug, dmso = "DMSO"))
 
-cdk_count_deseq <- cdk_count_combined %>%
-  dplyr::select(-method, -symbol) %>%
-  tidyr::spread(sample_id, count) %>%
-  as.data.frame() %>%
-  `rownames<-`(.$ensembl_gene_id) %>%
-  dplyr::select(-ensembl_gene_id)
+counts_passing <- bind_rows(data_sets$counts) %>%
+  select(symbol, sample_id, count) %>%
+  filter(sample_id %in% passing_ids) %>%
+  spread(sample_id, count) %>%
+  drop_na() %>%
+  column_to_rownames("symbol") %>%
+  as.matrix()
+
 
 ```
+
 
 Checking which conditions have a complete set of samples, with at least 2 replicates.
 Removing singleton samples without replicate.
@@ -47,33 +76,45 @@ Using only 6h time point.
 
 
 ```{r building_deseq_meta}
-cdk_comps_meta <- cdk_meta_combined %>%
-  filter(time == 6) %>%
+comps_meta <- meta_passing %>%
+  # `well` not required, `sample_id` works just fine, `experiment` redundant with
+  # `name`. `condition` not used
+  select(-well, -experiment, -condition) %>%
   # Nesting because I originally planned to do more complex filtering...
-  nest(sample_id) %>%
+  nest(sample_id, .key = "treatment") %>%
   # Keep conditions with >1 replicates
-  filter(map_lgl(data, ~nrow(.x) > 1)) %>%
+  filter(map_lgl(treatment, ~nrow(.x) > 1)) %>%
   # Check if each condition has a DMSO control
-  group_by(method, cell_line) %>%
+  group_by(name, method, cell_line, time, batch) %>%
   filter("DMSO" %in% drug) %>%
   ungroup() %>%
   # Add DMSO control sample_ids in each condition as a nested df
   nest_join(
-    filter(., drug == "DMSO") %>% unnest(data),
-    by = c("method", "cell_line", "time"),
+    filter(., drug == "DMSO") %>% unnest(treatment),
+    by = c("name", "method", "cell_line", "time", "batch"),
     name = "control"
   ) %>%
   # Don't want to compare DMSO with itself...
   filter(drug != "DMSO") %>%
+  # Now joining different batches
+  group_by(name, method, cell_line, drug, concentration, time) %>%
+  summarize_at(vars(treatment, control), ~list(bind_rows(.x))) %>%
   # Bulding DESeq2 metadata for each condition
   mutate(
-    sample_ids = map2(data, control, bind_rows) %>% map("sample_id"),
+    sample_ids = map2(treatment, control, bind_rows) %>% map("sample_id"),
     deseq_meta = map(
       sample_ids,
-      ~filter(cdk_meta_deseq, sample_id %in% .x) %>%
+      ~filter(meta_passing, sample_id %in% .x) %>%
         select(sample_id, everything()) %>%
         # Move DMSO control to first factor level
-        mutate(drug = fct_relevel(drug, "DMSO"))
+        mutate(drug = fct_relevel(drug, "DMSO")) %>%
+        column_to_rownames("sample_id")
+    ),
+    # Controlling for batch for drug treatments where data collection has occured
+    # in more than one batch
+    design = map(
+      deseq_meta,
+      ~if (length(unique(deseq_meta$batch)) > 1) ~drug + batch else ~drug
     )
   )
 ```
@@ -86,12 +127,12 @@ cdk_comps_meta <- cdk_meta_combined %>%
 ```{r deseq_drugs_vs_control}
 library(pbapply)
 # Adding count matrices for each condition
-cdk_comps_inputs <- cdk_comps_meta %>%
+comps_inputs <- comps_meta %>%
   mutate(
-    counts = map(deseq_meta, ~cdk_count_deseq[, .x$sample_id] %>% as.matrix())
+    counts = map(deseq_meta, ~counts_passing[, rownames(.x)])
   )
 
-run_deseq_comp <- function(meta, counts, design = ~drug) {
+run_deseq_comp <- function(meta, counts, design = ~drug + batch) {
   library(tidyverse)
   suppressMessages(
     DESeq2::DESeqDataSetFromMatrix(
@@ -106,14 +147,134 @@ run_deseq_comp <- function(meta, counts, design = ~drug) {
 n_workers = 10
 tryCatch({
     # compute_cluster <- parallel::makeCluster(n_workers, outfile = "deseq_worker.log")
-    cdk_deseq_res <- cdk_comps_inputs %>%
+    comp_deseqs <- comps_inputs %>%
       mutate(
         deseq = pbapply::pbmapply(
           # compute_cluster,
           run_deseq_comp,
           meta = deseq_meta,
           counts = counts,
-          MoreArgs = list(design = ~drug),
+          design = design,
+          SIMPLIFY = FALSE,
+          USE.NAMES = FALSE
+        )
+      )
+  },
+  finally = {
+    # message("Stopped cluster")
+    # parallel::stopCluster(compute_cluster)
+})
+
+readr::write_rds(comp_deseqs, file.path("deseq", "deseq_treatment_vs_control.rds"))
+# comp_deseqs <- readr::read_rds(file.path("deseq", "deseq_treatment_vs_control.rds"))
+
+
+comp_res <- comp_deseqs %>%
+  mutate(
+    result = map(
+      deseq,
+      function(d) {
+        name <- resultsNames(d)[[2]]
+        res <- results(d, name = name, alpha = 0.05)
+        # shrunk <- lfcShrink(d, coef = name, res = res, type = "apeglm")
+        as.data.frame(res) %>%
+          rownames_to_column("symbol") %>%
+          as_tibble()
+      }
+    )
+  )
+
+comp_res_df <- comp_res %>%
+  select(name, method, cell_line, drug, concentration, time, batch, experiment, condition, result)
+readr::write_rds(comp_res_df, file.path("deseq", "deseq_treatment_vs_control_result.rds"))
+
+# n_workers = 10
+# tryCatch({
+#     compute_cluster <- parallel::makeForkCluster(n_workers, outfile = "deseq_worker.log")
+#     split_comp_deseqs <- comp_deseqs %>%
+#       base::split(rep_len(1:n_workers, nrow(.)))
+#     split_comp_res <- pbapply::pblapply(
+#       split_comp_deseqs,
+#       function(chunk) {
+#         library(DESeq2)
+#         library(tidyverse)
+#         chunk %>%
+#           mutate(
+#             result = map(
+#               deseq,
+#               function(d) {
+#                 name <- resultsNames(d)[[2]]
+#                 res <- results(d, name = name, alpha = 0.05)
+#                 shrunk <- lfcShrink(d, coef = name, res = res, type = "apeglm")
+#                 as.data.frame(shrunk) %>%
+#                   rownames_to_column("symbol") %>%
+#                   as_tibble()
+#               }
+#             )
+#           )
+#       },
+#       cl = compute_cluster
+#     )
+#   },
+#   finally = {
+#     message("Stopped cluster")
+#     parallel::stopCluster(compute_cluster)
+# })
+
+
+```
+
+# Using linear model with log transformed concentration
+
+```{r deseq_drug_vs_control_log_model}
+cdk_comps_log_model_meta <- cdk_meta_combined %>%
+  filter(drug != "DMSO", sample_id %in% cdk_passing_ids) %>%
+  group_by(method, cell_line, drug, time) %>%
+  # Keep only conditions with at least two concentrations
+  filter(length(unique(concentration)) >= 2) %>%
+  group_nest(.key = "treatment") %>%
+  # Add DMSO control
+  nest_join(
+    filter(cdk_meta_combined, drug == "DMSO", sample_id %in% cdk_passing_ids),
+    by = c("method", "cell_line", "time"),
+    name = "control"
+  ) %>%
+  # Remove conditions without DMSO
+  filter(map_lgl(control, ~nrow(.x) > 0)) %>%
+  # Bulding DESeq2 metadata for each condition
+  mutate(
+    sample_ids = map2(treatment, control, bind_rows) %>% map("sample_id"),
+    deseq_meta = map(
+      sample_ids,
+      ~filter(cdk_meta_deseq, sample_id %in% .x) %>%
+        select(sample_id, everything()) %>%
+        mutate(
+          # Normalize log concentration [0, 3] uM to [0, 1] in log space
+          # That way log2FoldChanges are relative to maximum concentration of 3 uM
+          log_concentration = scales::rescale(log10(concentration + 1), from = c(0, log10(4))),
+          # Rename DMSO control to drug name (DMSO identified by log_conc = 0)
+          drug = setdiff(drug, "DMSO")
+        )
+    )
+  )
+
+# Adding count matrices for each condition
+cdk_comps_log_model_inputs <- cdk_comps_log_model_meta %>%
+  mutate(
+    counts = map(deseq_meta, ~cdk_count_deseq[, .x$sample_id] %>% as.matrix())
+  )
+
+n_workers = 10
+tryCatch({
+    # compute_cluster <- parallel::makeCluster(n_workers, outfile = "deseq_worker.log")
+    cdk_deseq_log_model_res <- cdk_comps_log_model_inputs %>%
+      mutate(
+        deseq = pbapply::pbmapply(
+          # compute_cluster,
+          run_deseq_comp,
+          meta = deseq_meta,
+          counts = counts,
+          MoreArgs = list(design = ~log_concentration, betaPrior = TRUE),
           SIMPLIFY = FALSE,
           USE.NAMES = FALSE
         ),
@@ -128,5 +289,85 @@ tryCatch({
     # parallel::stopCluster(compute_cluster)
 })
 
-readr::write_rds(cdk_deseq_res, file.path("deseq", "deseq_treatment_vs_control.rds"))
+readr::write_rds(cdk_deseq_log_model_res, file.path("deseq", "deseq_treatment_vs_control_log_model.rds"))
+
+# cdk_deseq_log_model_res <- read_rds(file.path("deseq", "deseq_treatment_vs_control_log_model.rds"))
+
+n_de_log_model <- cdk_deseq_log_model_res %>%
+  mutate(n_de = map_int(deseq_res, ~as_tibble(.x, rownames = "gene_id") %>% filter(padj < 0.05) %>% nrow()))
+
 ```
+
+
+```{r clustering_lfc}
+lfc_log_model <- cdk_deseq_log_model_res %>%
+  select(method, cell_line, drug, time, deseq_res) %>%
+  # filter(method == "dge") %>%
+  mutate(
+    condition = paste_(method, cell_line, drug, time),
+    deseq_res = map(deseq_res, as_tibble, rownames = "gene_id")
+  ) %>%
+  unnest(deseq_res)
+
+lfc_log_model_meta <- lfc_log_model %>%
+  select(condition, method, cell_line, drug, time) %>%
+  distinct() %>%
+  mutate(time = as.character(time)) %>%
+  column_to_rownames("condition")
+
+qual_maps <- RColorBrewer::brewer.pal.info %>%
+  rownames_to_column("name") %>%
+  filter(category == "qual") %>%
+  arrange(desc(maxcolors))
+
+lfc_log_model_cmaps <- lfc_log_model_meta %>%
+  summarize_all(~list(unique(.x))) %>%
+  gather(col, vals) %>%
+  mutate(n = map_int(vals, length)) %>%
+  arrange(desc(n)) %>%
+  mutate(
+    pname = qual_maps$name[1:n()],
+    palette = map2(
+      vals,
+      pname,
+      ~RColorBrewer::brewer.pal(max(3, length(.x)), .y)[1:length(.x)] %>% set_names(unlist(.x))
+    )
+  ) %>%
+  {set_names(.$palette, .$col)}
+
+lfc_log_model_matrix <- lfc_log_model %>%
+  select(condition, gene_id, log2FoldChange) %>%
+  spread(condition, log2FoldChange) %>%
+  drop_na() %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+# lfc_log_model_cor_matrix <- 1 - cor(lfc_log_model_matrix, method = "spearman")
+
+clust_cols <- hclust(
+  as.dist(1 - cor(lfc_log_model_matrix, method = "spearman")),
+  # dist(t(lfc_log_model_matrix), method = "euclidian"),
+  method = "average"
+)
+
+clust_rows <- hclust(
+  as.dist(1 - cor(t(lfc_log_model_matrix), method = "spearman")),
+  # dist(lfc_log_model_matrix, method = "euclidian"),
+  method = "average"
+)
+
+lfc_log_model_hm <- pheatmap::pheatmap(
+  lfc_log_model_matrix,
+  show_rownames = FALSE,
+  cluster_rows = clust_rows,
+  # cutree_rows = 4,
+  cluster_cols = clust_cols,
+  color = colorRampPalette(rev(RColorBrewer::brewer.pal(9, "RdBu")))(100),
+  breaks = seq(-1.0, 1.0, length.out = 100),
+  annotation_col = lfc_log_model_meta,
+  annotation_colors = lfc_log_model_cmaps,
+  silent = TRUE
+)
+ggsave(file.path("deseq", "l2fc_clustered_hc_spearman_average.pdf"), lfc_log_model_hm, width = 10, height = 10)
+```
+
