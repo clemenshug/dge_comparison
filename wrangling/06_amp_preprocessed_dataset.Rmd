@@ -59,7 +59,9 @@ meta <- list(
   mutate(
     sample_id = paste("ad", batch, Well, sep = "_"),
     time = 24L,
-    experiment = "ad"
+    experiment = "ad",
+    method = "dge",
+    cell_line = "ReNcell"
     # drug_id = ifelse(Drug == "dmso", "dmso", drug_id)
   ) %>%
   rename_all(str_to_lower)
@@ -70,7 +72,7 @@ counts_long <- counts_raw %>%
   gather(Well, count, -batch, -gene_id) %>%
   mutate(
     sample_id = paste("ad", batch, Well, sep = "_"),
-    experiment = "ad"
+    experiment = "ad",
   ) %>%
   filter(sample_id %in% meta$sample_id)
 

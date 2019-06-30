@@ -78,3 +78,30 @@ signature_meta <- signature_meta_raw %>%
 
 write_csv(signature_meta, file.path("..", "wrangled", "cmap_signature_meta.csv.gz"))
 ```
+
+
+```{r gene_meta}
+gene_meta_raw <- list(
+  GSE92742 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_gene_info.txt.gz",
+  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_gene_info_2017-03-06.txt.gz"
+) %>%
+  map(read_tsv, na = "-666") %>%
+  bind_rows(.id = "dataset")
+
+# Check if the two datasets are identical
+gene_meta_identical <- gene_meta_raw %>%
+  group_by_at(vars(-dataset)) %>%
+  summarize(n = n()) %>%
+  ungroup() %>%
+  dplyr::count(n)
+# They are!
+
+gene_meta <- gene_meta_raw %>%
+  filter(dataset == "GSE92742") %>%
+  genebabel::join_hgnc("pr_gene_symbol", c("symbol", "alias_symbol", "prev_symbol"), "symbol") %>%
+  select(-dataset)
+
+write_csv(gene_meta, file.path("..", "wrangled", "cmap_gene_meta.csv.gz"))
+```
+
+Gene metadata for both datasets are identical, can save just a single one.

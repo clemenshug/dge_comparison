@@ -60,7 +60,9 @@ cdk_dge_meta <- syn_csv("syn17022199") %>%
     # DGE data is all collected at 6h according to Kartik
     time = 6,
     # Adjusting concentration slightly so it matches bulk data
-    concentration = dplyr::recode(concentration, `3.16` = 3)
+    concentration = dplyr::recode(concentration, `3.16` = 3),
+    # Done in a single batch (as far as I can tell)
+    batch = "dge_1"
   ) %>%
   dplyr::select(-sample, -source_name)
 
@@ -74,7 +76,10 @@ cdk_bulk_rpkm_meta <- syn("syn17022201") %>%
 
 cdk_bulk_meta <- list(
   "201608" = syn_tsv("syn10155361") %>%
-    dplyr::mutate(DrugName = dplyr::recode(DrugName, `-` = "DMSO")) %>%
+    dplyr::mutate(
+      DrugName = dplyr::recode(DrugName, `-` = "DMSO"),
+      batch = "bulk_201608"
+    ) %>%
     dplyr::rename(sample_id = well, cell_line = CellLine),
   "201701" = syn_tsv("syn10155362") %>%
     tidyr::separate(Treatment, into = c("Conc", "DrugName"), sep = " ", fill = "left") %>%
@@ -82,7 +87,8 @@ cdk_bulk_meta <- list(
       Time = as.integer(stringr::str_extract(`Time point`, "[0-9]+")),
       Conc = tidyr::replace_na(as.numeric(Conc), 0),
       Sample = as.character(Sample),
-      DrugName = dplyr::recode(DrugName, ctrl = "DMSO")
+      DrugName = dplyr::recode(DrugName, ctrl = "DMSO"),
+      batch = "bulk_201701"
     ) %>%
     dplyr::rename(cell_line = `Cell line`, sample_id = Sample)
 ) %>%
@@ -174,7 +180,7 @@ cdk_meta_combined <- list(
   "dge" = cdk_dge_meta
 ) %>%
   dplyr::bind_rows(.id = "method") %>%
-  dplyr::mutate(sample_id = paste_(method, sample_id)) %>%
+  dplyr::mutate(sample_id = paste_("cdk", method, sample_id)) %>%
   dplyr::arrange(sample_id)
 
 matched_samples <- cdk_meta_combined %>%
@@ -208,7 +214,7 @@ cdk_count_combined <- list(
 ) %>%
   dplyr::bind_rows(.id = "method") %>%
   dplyr::filter(ensembl_gene_id %in% cdk_common_ids) %>%
-  dplyr::mutate(sample_id = paste_(method, sample_id)) %>%
+  dplyr::mutate(sample_id = paste_("cdk", method, sample_id)) %>%
   dplyr::arrange(sample_id)
 
 ```
