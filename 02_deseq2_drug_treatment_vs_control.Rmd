@@ -176,8 +176,8 @@ comp_res <- comp_deseqs %>%
       function(d) {
         name <- resultsNames(d)[[2]]
         res <- results(d, name = name, alpha = 0.05)
-        # shrunk <- lfcShrink(d, coef = name, res = res, type = "apeglm")
-        as.data.frame(res) %>%
+        shrunk <- lfcShrink(d, coef = name, res = res, type = "apeglm")
+        as.data.frame(shrunk) %>%
           rownames_to_column("symbol") %>%
           as_tibble()
       }
@@ -185,42 +185,8 @@ comp_res <- comp_deseqs %>%
   )
 
 comp_res_df <- comp_res %>%
-  select(name, method, cell_line, drug, concentration, time, batch, experiment, condition, result)
+  select(name, method, cell_line, drug, concentration, time, result)
 readr::write_rds(comp_res_df, file.path("deseq", "deseq_treatment_vs_control_result.rds"))
-
-# n_workers = 10
-# tryCatch({
-#     compute_cluster <- parallel::makeForkCluster(n_workers, outfile = "deseq_worker.log")
-#     split_comp_deseqs <- comp_deseqs %>%
-#       base::split(rep_len(1:n_workers, nrow(.)))
-#     split_comp_res <- pbapply::pblapply(
-#       split_comp_deseqs,
-#       function(chunk) {
-#         library(DESeq2)
-#         library(tidyverse)
-#         chunk %>%
-#           mutate(
-#             result = map(
-#               deseq,
-#               function(d) {
-#                 name <- resultsNames(d)[[2]]
-#                 res <- results(d, name = name, alpha = 0.05)
-#                 shrunk <- lfcShrink(d, coef = name, res = res, type = "apeglm")
-#                 as.data.frame(shrunk) %>%
-#                   rownames_to_column("symbol") %>%
-#                   as_tibble()
-#               }
-#             )
-#           )
-#       },
-#       cl = compute_cluster
-#     )
-#   },
-#   finally = {
-#     message("Stopped cluster")
-#     parallel::stopCluster(compute_cluster)
-# })
-
 
 ```
 
