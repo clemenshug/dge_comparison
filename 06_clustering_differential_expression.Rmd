@@ -1,0 +1,107 @@
+---
+title: "Clustering differential expression"
+author: "Clemens Hug"
+date: "7/1/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+```
+
+## Goal
+
+Clustering raw expression, variance stabilized expression and pairwise log2Fold
+changes to check if data clusters by treatment or by platform.
+
+```{r loading}
+comp_results <- readr::read_rds(file.path("deseq", "deseq_treatment_vs_control_result.rds")) %>%
+  ungroup()
+```
+
+## Clustering log fold changes
+
+```{r preparing_data}
+results <- comp_results %>%
+  # filter(method == "dge") %>%
+  mutate(
+    condition = paste(name, method, cell_line, drug, concentration, time, sep = "_")
+  ) %>%
+  unnest(result)
+
+results_meta <- results %>%
+  select(name, condition, method, cell_line, drug, concentration, time) %>%
+  distinct() %>%
+  mutate(time = as.character(time))
+```
+
+```{r selecting_color_maps}
+qual_maps <- RColorBrewer::brewer.pal.info %>%
+  rownames_to_column("name") %>%
+  filter(category == "qual") %>%
+  arrange(desc(maxcolors))
+```
+
+Clustering only CDK for now, only one with matching DGE and bulk RNA-seq
+
+```{r clustering_cdk}
+results_meta_cdk <- results_meta %>%
+  filter(name == "cdk")
+
+results_cdk <- results %>%
+  filter(condition %in% results_meta_cdk$condition)
+
+parameter_cmaps <- results_meta_cdk %>%
+  select(cell_line, method, drug, concentration, time) %>%
+  summarize_all(~list(unique(.x))) %>%
+  gather(col, vals) %>%
+  mutate(n = map_int(vals, length)) %>%
+  arrange(desc(n)) %>%
+  mutate(
+    pname = qual_maps$name[1:n()],
+    palette = map2(
+      vals,
+      pname,
+      ~RColorBrewer::brewer.pal(max(3, length(.x)), .y)[1:length(.x)] %>% set_names(unlist(.x))
+    )
+  ) %>%
+  {set_names(.$palette, .$col)}
+
+lfc_matrix_cdk <- results_cdk %>%
+  select(condition, symbol, log2FoldChange) %>%
+  spread(condition, log2FoldChange) %>%
+  drop_na() %>%
+  column_to_rownames("symbol") %>%
+  as.matrix()
+
+# lfc_log_model_cor_matrix <- 1 - cor(lfc_log_model_matrix, method = "spearman")
+
+clust_cols <- hclust(
+  as.dist(1 - cor(lfc_matrix_cdk, method = "spearman")),
+  # dist(t(lfc_log_model_matrix), method = "euclidian"),
+  method = "average"
+)
+
+clust_rows <- hclust(
+  as.dist(1 - cor(t(lfc_matrix_cdk), method = "spearman")),
+  # dist(lfc_log_model_matrix, method = "euclidian"),
+  method = "average"
+)
+
+lf_hm_cdk <- pheatmap::pheatmap(
+  lfc_matrix_cdk,
+  show_rownames = FALSE,
+  cluster_rows = clust_rows,
+  # cutree_rows = 4,
+  cluster_cols = clust_cols,
+  color = colorRampPalette(rev(RColorBrewer::brewer.pal(9, "RdBu")))(100),
+  breaks = seq(-1.0, 1.0, length.out = 100),
+  annotation_col = results_meta_cdk %>%
+    select(condition, cell_line, method, drug, concentration, time) %>%
+    column_to_rownames("condition"),
+  annotation_colors = parameter_cmaps,
+  silent = TRUE
+)
+ggsave(file.path("deseq", "cdk_log2fc_hc_spearman_average.pdf"), lf_hm_cdk, width = 10, height = 10)
+```
+
