@@ -38,14 +38,22 @@ CDK4/6 inhibitor dataset collected by Caitlin Mills
 
 ```{r loading_datasets}
 dub_dge_meta <- syn_tsv("syn12979088") %>%
-  dplyr::rename(cell_line = cellline) %>%
+  dplyr::rename(cell_line = cellline, drug = agent) %>%
   dplyr::select(-column, -row, -plate) %>%
-  dplyr::mutate(sample_id = paste("dub", "dge", cell_line, agent, concentration, time, well, sep = "_"))
+  dplyr::mutate(
+    sample_id = paste("dub", "dge", cell_line, drug, concentration, time, well, sep = "_"),
+    batch = "dge_1",
+    method = "dge"
+  )
 
 dub_dge_counts <- syn_tsv("syn12612304") %>%
   dplyr::select(-HUGO) %>%
   dplyr::rename(ensembl_gene_id = ENSEMBL) %>%
   tidyr::gather(well, count, -ensembl_gene_id) %>%
+  # As per the description at syn13363863, removing P11_old (119 counts), P11_new2 (673 counts)
+  # and keeping only P11_new1 (227,020 counts)
+  dplyr::filter(!(well %in% c("P11_new2", "P11_old"))) %>%
+  dplyr::mutate(well = recode(well, P11_new1 = "P11")) %>%
   dplyr::left_join(dub_dge_meta %>% dplyr::select(well, sample_id), by = "well") %>%
   dplyr::select(sample_id, ensembl_gene_id, count)
 
