@@ -1,0 +1,174 @@
+---
+title: "CDK4/6 new run"
+author: "Clemens Hug"
+date: "9/19/2019"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(ssh)
+library(readxl)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("~/data/DGE_comp/")
+```
+
+## Goal
+
+Load and process RNA-seq counts from the CDK4/6 inhibitor experiment perfomed
+by Caitlin Mills and Kartik Subramanian. This is wrangling the completely new
+CDK4/6 inhibitor dataset that was performed 09/19.
+Table of samples and the location of the raw data at
+https://docs.google.com/spreadsheets/d/1U-Pjl5pIwPpa1hEMU-Xh-RvUNqiW633mPs6Yzj98ULQ/edit?usp=sharing
+
+
+## Preprocessed
+
+
+```{r loading_datasets}
+tmpdir <- tempdir()
+session <- ssh_connect("ch305@transfer.rc.hms.harvard.edu", keyfile = "~/.ssh/id_ecdsa")
+
+scp_download(session, "/n/files/ImStor/sorger/data/rnaseq/lincs/cdk7_all_combined/s*/final/S*/*.mtx*", to = tmpdir)
+scp_download(session, "/n/files/ImStor/sorger/data/rnaseq/lincs/cdk7_all_combined/cdk4-6_metadata.csv", to = tmpdir)
+
+ssh_disconnect(session)
+
+barcode_well_map <- syn("syn12979100") %>%
+  read_xlsx(sheet = "barcodes_trugrade_384_set1")
+
+meta_raw <- read_csv(file.path(tmpdir, "cdk4-6_metadata.csv")) %>%
+  mutate(sample_id = paste("dge_new", bcbio_sample_id, well, sep = "_"))
+
+prepare_col_meta <- function(colmeta_file, barcode_map) {
+  read_csv(colmeta_file, col_names = "barcode") %>%
+    mutate(col_idx = 1:n()) %>%
+    left_join(
+      barcode_map %>%
+        select(barcode, well),
+      by = "barcode"
+    )
+}
+
+prepare_row_meta <- function(rowmeta_file) {
+  read_csv(rowmeta_file, col_names = "ensembl_gene_id") %>%
+    mutate(row_idx = 1:n())
+}
+
+prepare_mtx_sparse <- function(mtx_file) {
+  read_delim(
+    mtx_file,
+    delim = " ",
+    skip = 3,
+    col_names = c("row_idx", "col_idx", "count"),
+    col_types = "iii"
+  )
+}
+
+datasets <- tibble(
+  bcbio_sample_id = paste0("S", 2:6)
+) %>%
+  mutate(
+    mtx = map(file.path(tmpdir, paste0(bcbio_sample_id, ".mtx")), prepare_mtx_sparse),
+    col_meta = map(
+      file.path(tmpdir, paste0(bcbio_sample_id, ".mtx.colnames")),
+      prepare_col_meta, barcode_map = barcode_well_map
+    ),
+    row_meta = map(file.path(tmpdir, paste0(bcbio_sample_id, ".mtx.rownames")), prepare_row_meta)
+  )
+
+
+
+```
+
+```{r gene_id_mapping}
+# mart <- biomaRt::useMart(
+#   "ENSEMBL_MART_ENSEMBL",
+#   "hsapiens_gene_ensembl"
+# )
+# ensembl_gene_id_mapping_hgnc <- biomaRt::select(
+#   mart, unique(row_meta$ensembl_gene_id),
+#   c("hgnc_symbol", "ensembl_gene_id"), "ensembl_gene_id"
+# )
+# 
+# ensembl_gene_id_mapping_hgnc <- ensembl_gene_id_mapping_hgnc %>%
+#   # rename(symbol = hgnc_symbol) %>%
+#   mutate(symbol = if_else(symbol == "", NA_character_, symbol)) %>%
+#   # Excluding any ensembl ids that map to multiple HGNC symbols from analysis
+#   # At the moment this is only ENSG00000187510
+#   group_by(ensembl_gene_id) %>%
+#   summarize(symbol = if (n() == 1) symbol else NA_character_)
+
+ensembl_gene_id_mapping_hgnc <- genebabel::query_hgnc(
+  datasets$row_meta %>%
+    map(pull, "ensembl_gene_id") %>%
+    {do.call(c, .)} %>%
+    unique(),
+  c("ensembl_gene_id")
+) %>%
+  select(ensembl_gene_id = query, symbol) %>%
+  group_by(ensembl_gene_id) %>%
+  summarize(symbol = if (n() == 1) symbol else NA_character_)
+```
+
+
+```{r format_data}
+meta <- meta_raw %>%
+  drop_na(agent, bcbio_sample_id) %>%
+  transmute(
+    sample_id,
+    cell_line,
+    drug = agent,
+    # Adjusting concentration slightly so it matches bulk CDK data
+    concentration = signif(concentration, digits = 1),
+    time = timepoint,
+    batch = "dge_new_all",
+    method = "dge"
+  )
+
+prepare_counts <- function(mtx, col_meta, row_meta, gene_mapping) {
+  mtx %>%
+    left_join(col_meta, by = "col_idx") %>%
+    left_join(row_meta, by = "row_idx") %>%
+    select(well, ensembl_gene_id, count) %>%
+    left_join(
+      gene_mapping, by = "ensembl_gene_id"
+    ) %>%
+    # Only a single gene ENSG00000187510
+    drop_na(symbol)
+}
+
+counts_long <- datasets %>%
+  transmute(
+    bcbio_sample_id,
+    data = pmap(
+      list(mtx, col_meta, row_meta),
+      prepare_counts,
+      gene_mapping = ensembl_gene_id_mapping_hgnc
+    )
+  ) %>%
+  unnest(data) %>%
+  mutate(
+    sample_id = paste("dge_new", bcbio_sample_id, well, sep = "_")
+  ) %>%
+  select(sample_id, ensembl_gene_id, symbol, count)
+
+
+counts_selected <- counts_long %>%
+  filter(sample_id %in% meta$sample_id)
+
+meta_selected <- meta %>%
+  filter(sample_id %in% counts_long$sample_id)
+```
+
+
+```{r writing to disk}
+cdk_dir <- here("wrangled", "cdk_new")
+dir.create(cdk_dir, showWarnings = FALSE)
+
+write_csv(meta_selected, file.path(cdk_dir, "meta.csv"))
+write_csv(counts_selected, file.path(cdk_dir, "counts.csv.gz"))
+```
