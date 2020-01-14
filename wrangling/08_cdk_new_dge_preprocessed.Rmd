@@ -11,6 +11,7 @@ library(synExtra)
 library(here)
 library(ssh)
 library(readxl)
+library(rvest)
 
 synapser::synLogin()
 syn <- synExtra::synDownloader("~/data/DGE_comp/")
@@ -34,11 +35,14 @@ session <- ssh_connect("ch305@transfer.rc.hms.harvard.edu", keyfile = "~/.ssh/id
 
 scp_download(session, "/n/files/ImStor/sorger/data/rnaseq/lincs/cdk7_all_combined/s*/final/S*/*.mtx*", to = tmpdir)
 scp_download(session, "/n/files/ImStor/sorger/data/rnaseq/lincs/cdk7_all_combined/cdk4-6_metadata.csv", to = tmpdir)
+scp_download(session, "/n/files/ImStor/sorger/data/rnaseq/lincs/cdk7_all_combined/all_files_bcbio_meta.csv", to = tmpdir)
 
 ssh_disconnect(session)
 
 barcode_well_map <- syn("syn12979100") %>%
   read_xlsx(sheet = "barcodes_trugrade_384_set1")
+
+bcbio_meta <- read_csv(file.path(tmpdir, "all_files_bcbio_meta.csv"))
 
 meta_raw <- read_csv(file.path(tmpdir, "cdk4-6_metadata.csv")) %>%
   mutate(sample_id = paste("dge_new", bcbio_sample_id, well, sep = "_"))
@@ -66,6 +70,13 @@ prepare_mtx_sparse <- function(mtx_file) {
     col_names = c("row_idx", "col_idx", "count"),
     col_types = "iii"
   )
+  # mat <- Matrix::readMM(mtx_file)
+  # trip <- as(mat, "dgTMatrix")
+  # tibble(
+  #   row_idx = trip@i + 1L,
+  #   col_idx = trip@j + 1L,
+  #   count = as.integer(trip@x)
+  # )
 }
 
 datasets <- tibble(
@@ -73,6 +84,7 @@ datasets <- tibble(
 ) %>%
   mutate(
     mtx = map(file.path(tmpdir, paste0(bcbio_sample_id, ".mtx")), prepare_mtx_sparse),
+    mtx_dupes = map(file.path(tmpdir, paste0(bcbio_sample_id, "-dupes.mtx")), prepare_mtx_sparse),
     col_meta = map(
       file.path(tmpdir, paste0(bcbio_sample_id, ".mtx.colnames")),
       prepare_col_meta, barcode_map = barcode_well_map
@@ -83,6 +95,60 @@ datasets <- tibble(
 
 
 ```
+Count number of reads in fastq files
+
+
+```{r fastq_reads}
+bcbio_meta_fastq <- bcbio_meta %>%
+  mutate(
+    fastq = str_replace(fastq, fixed("transfer.rc.hms.harvard.edu:"), ""),
+    fastq_html_name = paste0(str_sub(basename(fastq), end = -10), "_fastqc.html"),
+    fastq_html = file.path(dirname(fastq), "..", "QC", fastq_html_name),
+    target_dir = file.path(tmpdir, paste0("fastqc_", 1:n()))
+  )
+
+session <- ssh_connect("ch305@transfer.rc.hms.harvard.edu", keyfile = "~/.ssh/id_ecdsa")
+
+pwalk(
+  with(bcbio_meta_fastq, list(fastq_html, target_dir)),
+  function(fastq_html, target_dir) {
+    dir.create(target_dir, showWarnings = FALSE)
+    scp_download(session, fastq_html, to = target_dir)
+  }
+)
+
+ssh_disconnect(session)
+
+bcbio_meta_counts <- bcbio_meta_fastq %>%
+  transmute(
+    id,
+    fastq = basename(fastq),
+    html = map(
+      file.path(target_dir, basename(fastq_html)),
+      read_html
+    ),
+    stats_table = map(
+      html,
+      ~.x %>%
+        html_node(xpath = "//table") %>%
+        html_table()
+    ),
+    n_reads = map_int(
+      stats_table,
+      ~.x %>%
+        filter(Measure == "Total Sequences") %>%
+        chuck("Value", 1) %>%
+        as.integer()
+    )
+  )
+
+bcbio_meta_counts_total <- bcbio_meta_counts %>%
+  group_by(id) %>%
+  summarize(n_reads = sum(n_reads) %/% 2) %>%
+  ungroup()
+
+```
+
 
 ```{r gene_id_mapping}
 # mart <- biomaRt::useMart(
@@ -141,27 +207,65 @@ prepare_counts <- function(mtx, col_meta, row_meta, gene_mapping) {
     drop_na(symbol)
 }
 
-counts_long <- datasets %>%
+counts <- datasets %>%
   transmute(
     bcbio_sample_id,
-    data = pmap(
+    count = pmap(
       list(mtx, col_meta, row_meta),
+      prepare_counts,
+      gene_mapping = ensembl_gene_id_mapping_hgnc
+    ),
+    count_dupes = pmap(
+      list(mtx_dupes, col_meta, row_meta),
       prepare_counts,
       gene_mapping = ensembl_gene_id_mapping_hgnc
     )
   ) %>%
+  gather("count_type", "data", count, count_dupes)
+
+counts_long <- counts %>%
+  filter(count_type == "count") %>%
   unnest(data) %>%
   mutate(
     sample_id = paste("dge_new", bcbio_sample_id, well, sep = "_")
   ) %>%
   select(sample_id, ensembl_gene_id, symbol, count)
 
-
 counts_selected <- counts_long %>%
   filter(sample_id %in% meta$sample_id)
 
 meta_selected <- meta %>%
   filter(sample_id %in% counts_long$sample_id)
+
+count_stats <- counts %>%
+  transmute(
+    bcbio_sample_id,
+    count_type,
+    count = map_dbl(data, ~sum(.x$count))
+  ) %>%
+  spread(count_type, count) %>%
+  left_join(bcbio_meta_counts_total, by = c("bcbio_sample_id" = "id")) %>%
+  select(bcbio_sample_id, n_reads, count_dupes, count)
+
+cowplot::ggsave2(
+  here("cdk_new_read_counts.pdf"),
+  gridExtra::tableGrob(count_stats)
+)
+
+cowplot::ggsave2(
+  here("cdk_new_read_counts_percent.pdf"),
+  count_stats %>%
+    mutate_at(
+      vars(n_reads, count_dupes, count),
+      function(col, n_reads) {
+        round(col/n_reads, 2)
+      },
+      .$n_reads
+    ) %>%
+    gridExtra::tableGrob()
+)
+
+
 ```
 
 
