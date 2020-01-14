@@ -3,6 +3,7 @@
 library(tidyverse)
 library(synExtra)
 library(biomaRt)
+library(here)
 
 synapser::synLogin()
 syn <- synExtra::synDownloader("~/data/DGE_comp/")
@@ -118,6 +119,36 @@ cdk_bulk_counts <- list(
   dplyr::rename(ensembl_gene_id = id)
 
 ```
+
+```{r dge_read_stats}
+#/n/files/ImStor/sorger/data/rnaseq/lincs/CDK46_GEO_submission/DGE/FASTQ/CDK_20170825.R1.fastq.gz
+n_reads <- 256073865L
+cdk_dge_count_stats <- cdk_dge_counts %>%
+  summarize(count = sum(count)) %>%
+  transmute(sample = "DGE_CDK_20170825", n_reads = n_reads, count)
+
+cowplot::ggsave2(
+  here("cdk_old_read_counts.pdf"),
+  gridExtra::tableGrob(cdk_dge_count_stats)
+)
+
+cowplot::ggsave2(
+  here("cdk_old_read_counts_percent.pdf"),
+  cdk_dge_count_stats %>%
+    mutate_at(
+      vars(n_reads, count),
+      function(col, n_reads) {
+        round(col/n_reads, 2)
+      },
+      .$n_reads
+    ) %>%
+    gridExtra::tableGrob()
+)
+
+cdk_dge_count_table_percent <- cdk_dge_count_table %>%
+  mutate(n_reads = n_reads/n_reads, count = count/n_reads)
+```
+
 
 ## Match IDs from DGE and bulk
 
