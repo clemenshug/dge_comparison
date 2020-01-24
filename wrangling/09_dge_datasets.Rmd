@@ -1,0 +1,365 @@
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(readxl)
+library(here)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("~/data/DGE_comp/")
+
+wd <- here("wrangled")
+```
+
+
+```{r wrangling_funcs}
+barcode_well_map <- syn("syn12979100") %>%
+  read_xlsx(sheet = "barcodes_trugrade_384_set1")
+  # rename(Barcode = barcode, Well = well, Plate_ID = plate_id)
+
+prepare_barcode_counts <- function(barcode_count_file, barcode_map) {
+  read_tsv(barcode_count_file, col_names = c("barcode", "count")) %>%
+    mutate(
+      barcode = str_replace(barcode, "^.*([ATCG]{6})$", "\\1")
+    ) %>%
+    left_join(
+      barcode_well_map, by = "barcode"
+    )
+}
+
+prepare_col_meta <- function(colmeta_file, barcode_map) {
+  read_csv(colmeta_file, col_names = "barcode") %>%
+    mutate(
+      barcode = if (all(str_detect(barcode, fixed(":")))) str_split(barcode, fixed(":"), simplify = TRUE)[, 2] else barcode,
+      col_idx = 1:n()
+    ) %>%
+    left_join(
+      barcode_map %>%
+        select(barcode, well),
+      by = "barcode"
+    )
+}
+
+prepare_row_meta <- function(rowmeta_file) {
+  read_csv(rowmeta_file, col_names = "ensembl_gene_id") %>%
+    mutate(row_idx = 1:n())
+}
+
+prepare_mtx_sparse <- function(mtx_file) {
+  read_delim(
+    mtx_file,
+    delim = " ",
+    skip = 3,
+    col_names = c("row_idx", "col_idx", "count"),
+    col_types = "iii"
+  )
+}
+
+prepare_counts <- function(mtx, col_meta, row_meta, gene_mapping) {
+  # browser()
+  mtx %>%
+    left_join(col_meta, by = "col_idx") %>%
+    left_join(row_meta, by = "row_idx") %>%
+    select(well, ensembl_gene_id, count) %>%
+    inner_join(
+      gene_mapping, by = "ensembl_gene_id"
+    )
+}
+
+```
+
+## John Santa Maria Merck drugs
+
+Load and process RNA-seq data from John Santa Maria
+
+John Santa Maria initiated a project looking at gene expression underlying phenotypic changes in intestinal myofibroblasts.
+
+Cells were looked at for one time point at 3 drug doses in triplicate.  This was done either in the presence or absense of activating stimulus IL-1B.
+
+
+-These cells were purchased from Lonza and originate from terminal fetuses. They are intestinal myofibroblasts.
+-These are immunomodulatory drugs, most of which are public, save 2 which are private Merck compounds. All the data is jointly owned by Sorger and Merck, but the 2 private structures may be retained by the company (they also may not, as they are not of general interest).
+
+- Sarah is in touch with Jon to get more details on the treatment of the cells.
+
+Update 7_25_18
+
+Primary human intestinal myofibroblasts were treated with a collection of tool compounds in dose series. The fibroblasts were treated with incubated with drugs for 24 hours. Then, either vehicle or 0.1 ng/mL IL-1B for 0, 1, or 6 hours before harvesting for DGE-Seq.
+
+
+transfer.rc.hms.harvard.edu:/n/files/ImStor/sorger/data/rnaseq/lincs/DGE_fastq_files/cdk46_runs_batch2/170831_NS500422_0543_AHWKJLBGX2/
+
+## Metadata
+
+```{r jsm_meta}
+
+# cmp_table <- syn("syn21094266") %>%
+#   read_csv()
+# 
+# cmpd_name_map <- cmp_table %>%
+#   drop_na(pref_name) %>%
+#   transmute(
+#     lspci_id,
+#     name = map2(
+#       pref_name, alt_names,
+#       ~c(
+#         .x,
+#         if (is.na(.y)) NULL else str_split(.y, fixed("|"))[[1]]
+#       )
+#     )
+#   ) %>%
+#   unnest_longer(name)
+
+jsm_meta_raw <- syn("syn21541012") %>%
+  read_tsv()
+
+jsm_meta <- jsm_meta_raw %>%
+  transmute(
+    well = str_replace(Well, "^([A-Z])([1-9])$", "\\10\\2"),
+    cells = Cells,
+    stim = Stim,
+    stim_conc = `StimConc(inng/mL)`,
+    drug = Drug,
+    drug_conc = `DrugConc(inuM)`,
+    condition = paste(cells, stim, stim_conc, drug, drug_conc, sep = "_"),
+    sample_id = paste("jsm_merck", Plate, well, cells, stim, stim_conc, drug, drug_conc, sep = "_")
+  )
+
+
+```
+
+
+```{r lincs_cdk4_6_old_meta}
+cdk_old_meta_raw <- synapser::synGet("syn21542403", followLink = TRUE) %>%
+  chuck("path") %>%
+  read_csv()
+
+cdk_old_meta <- cdk_old_meta_raw %>%
+  transmute(
+    well,
+    cells = cell_line,
+    drug,
+    drug_conc = concentration__um,
+    condition = paste(cells, drug, drug_conc, sep = "_"),
+    sample_id = paste("lincs_cdk4_6_old", well, cells, drug, drug_conc, sep = "_")
+  )
+
+```
+
+
+```{r lincs_cdk4_6_7_new_meta}
+cdk_new_meta_raw <- syn("syn21544269") %>%
+  read_csv()
+
+cdk_new_meta <- cdk_new_meta_raw %>%
+  drop_na(cell_line) %>%
+  transmute(
+    plate,
+    well,
+    cells = cell_line,
+    drug  = agent,
+    drug_conc = concentration,
+    condition = paste(cells, drug, drug_conc, sep = "_"),
+    sample_id = paste("lincs_cdk4_6_7_new", plate, well, cells, drug, drug_conc, sep = "_")
+  )
+
+```
+
+
+```{r ld_dub_meta}
+ld_dub_raw <- synapser::synGet("syn21542711", followLink = TRUE) %>%
+  chuck("path") %>%
+  read_tsv()
+
+ld_dub_meta <- ld_dub_raw %>%
+  transmute(
+    well,
+    cells = cellline,
+    drug = agent,
+    drug_conc = concentration,
+    time,
+    condition = paste(cells, drug, drug_conc, time, sep = "_"),
+    sample_id = paste("ld_dub", well, cells, drug, drug_conc, time, sep = "_")
+  )
+
+```
+
+
+```{r counts}
+dataset_syn <- tribble(
+  ~dataset, ~folder_syn,
+  "jsm_merck", "syn21541313",
+  "lincs_cdk4_6_old", "syn21541462",
+  "ld_dub", "syn21541471",
+  "lincs_cdk4_6_7_new", "syn21541479"
+) %>%
+  mutate(
+    files = map(
+      folder_syn,
+      function(x) {
+        folder_content = synChildren(x)
+        cm_match <- str_match(names(folder_content), "^(?:(.*[0-9]+)|tagcounts)\\.mtx$")
+        cm_hit <- !is.na(cm_match[, 1])
+        # browser()
+        if (sum(cm_hit) > 1) {
+          plate_idx <- cm_match[, 2][cm_hit]
+          tibble(
+            plate = plate_idx,
+            counts = folder_content[cm_hit],
+            count_dupes = folder_content[paste0(plate_idx, "-dupes.mtx")],
+            colnames = folder_content[paste0(plate_idx, ".mtx.colnames")],
+            rownames = folder_content[paste0(plate_idx, ".mtx.rownames")],
+            barcode_counts = folder_content[paste0(plate_idx, "-barcodes.tsv")]
+          )
+        } else {
+          tibble(
+            plate = "1",
+            counts = folder_content["tagcounts.mtx"],
+            count_dupes = folder_content["tagcounts-dupes.mtx"],
+            colnames = folder_content["tagcounts.mtx.colnames"],
+            rownames = folder_content["tagcounts.mtx.rownames"],
+            barcode_counts = folder_content["cb-histogram.txt"]
+          )
+        }
+      }
+    )
+  ) %>%
+  unnest(files)
+
+# tribble(
+#   ~dataset, ~plate, ~counts, ~count_dupes, ~colnames, ~rownames, ~barcode_counts,
+#   "jsm_merck", 1, "syn21541457", "syn21541454", "syn21541458", "syn21541460", "syn21541800",
+#   "lincs_cdk4_6_old", 1, "syn21541467", "syn21541463", "syn21541468", "syn21541470", "syn21541804",
+#   "ld_dub", 1, "syn21541475", "syn21541472", "syn21541476", "syn21541478", "syn21541808",
+#   
+# )
+
+dataset_files <- dataset_syn %>%
+  mutate_at(vars(-dataset, -folder_syn), map_chr, syn)
+
+datasets_raw <- dataset_files %>%
+  mutate_at(
+    vars(counts, count_dupes),
+    map, prepare_mtx_sparse
+  ) %>%
+  mutate(
+    barcode_counts = map(barcode_counts, prepare_barcode_counts, barcode_well_map) %>%
+      map(
+        function(x) {
+          # Only keep P11 well with highest count
+          # browser()
+          x %>%
+            mutate(well_id = str_split_fixed(well, fixed("_"), 2)[, 1]) %>%
+            arrange(well_id, desc(count)) %>%
+            group_by(well_id) %>%
+            slice(1) %>%
+            ungroup() %>%
+            select(barcode, well = well_id, count)
+        }
+      ),
+    barcode_map = map(
+      barcode_counts,
+      select,
+      well, barcode
+    ),
+    colnames = map2(colnames, barcode_map, prepare_col_meta),
+    rownames = map(rownames, prepare_row_meta)
+  )
+
+all_ensembl_ids <- datasets_raw %>%
+  pull(rownames) %>%
+  map("ensembl_gene_id") %>%
+  reduce(union)
+
+mart <- biomaRt::useMart(
+  host = "http://sep2019.archive.ensembl.org",
+  biomart = "ENSEMBL_MART_ENSEMBL",
+  dataset = "hsapiens_gene_ensembl"
+)
+ensembl_gene_id_mapping_biomart <- biomaRt::select(
+  mart, all_ensembl_ids,
+  c("hgnc_symbol", "ensembl_gene_id", "gene_biotype"), "ensembl_gene_id"
+) %>%
+  as_tibble() %>%
+  filter(gene_biotype == "protein_coding") %>%
+  mutate(hgnc_symbol = magrittr::inset(hgnc_symbol, hgnc_symbol == "", NA_character_)) %>%
+  rename(symbol = hgnc_symbol) %>%
+  select(-gene_biotype)
+
+datasets_well <- datasets_raw %>%
+  transmute(
+    dataset,
+    plate,
+    counts = pmap(
+      list(counts, colnames, rownames),
+      prepare_counts,
+      ensembl_gene_id_mapping_biomart
+    ),
+    count_dupes = pmap(
+      list(count_dupes, colnames, rownames),
+      prepare_counts,
+      ensembl_gene_id_mapping_biomart
+    ),
+    barcode_counts
+  )
+```
+
+
+```{r datasets_with_meta}
+meta_all <- tribble(
+  ~dataset, ~meta,
+  "jsm_merck", jsm_meta,
+  "lincs_cdk4_6_old", cdk_old_meta,
+  "ld_dub", ld_dub_meta,
+  "lincs_cdk4_6_7_new", cdk_new_meta
+) %>%
+  unnest(meta) %>%
+  group_nest(dataset, plate, .key = "meta") %>%
+  mutate(plate = if_else(is.na(plate), "1", as.character(plate)))
+
+
+datasets <- datasets_well %>%
+  inner_join(meta_all, by = c("dataset", "plate")) %>%
+  mutate_at(
+    vars(-dataset, -plate),
+    map2,
+    .$meta,
+    ~.x %>%
+      left_join(
+        select(.y, well, sample_id),
+        by = "well"
+      )
+  ) %>%
+  select(-meta)
+
+
+write_rds(
+  datasets,
+  file.path(wd, "counts_raw.rds")
+)
+
+```
+
+```{r synapse}
+activity <- synapser::Activity(
+  name = "Wrangle DGE data",
+  used = c(
+    "syn12979100",
+    "syn21541012",
+    "syn21542403",
+    "syn21542711",
+    dataset_syn %>%
+      select(-dataset, -folder_syn, -plate) %>%
+      reduce(union)
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/wrangling/09_dge_datasets.Rmd"
+)
+
+c(
+  file.path(wd, "counts_raw.rds")
+) %>%
+  synStoreMany(parentId = "syn21542764", activity = activity)
+
+
+```
+
