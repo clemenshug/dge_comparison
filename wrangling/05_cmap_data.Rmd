@@ -8,6 +8,7 @@ output: html_document
 ```{r setup, include=FALSE}
 library(tidyverse)
 library(cmapR)
+library(webchem)
 ```
 
 ## CMap data
@@ -105,3 +106,32 @@ write_csv(gene_meta, file.path("..", "wrangled", "cmap_gene_meta.csv.gz"))
 ```
 
 Gene metadata for both datasets are identical, can save just a single one.
+
+```{r synapse}
+activity <- synapser::Activity(
+  name = "Wrangle CMap data",
+  used = c(
+    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_pert_info.txt.gz",
+    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_pert_info_2017-03-06.txt.gz",
+    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_inst_info.txt.gz",
+    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_inst_info_2017-03-06.txt.gz",
+    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_sig_info.txt.gz",
+    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_sig_info_2017-03-06.txt.gz",
+    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_gene_info.txt.gz",
+    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_gene_info_2017-03-06.txt.gz"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/wrangling/05_cmap_data.Rmd"
+)
+
+c(
+  file.path("..", "wrangled", "cmap_perturbation_meta.csv.gz"),
+  file.path("..", "wrangled", "cmap_instance_meta.csv.gz"),
+  file.path("..", "wrangled", "cmap_signature_meta.csv.gz"),
+  file.path("..", "wrangled", "cmap_gene_meta.csv.gz")
+) %>%
+  synStoreMany(parentId = "syn21547022", activity = activity)
+
+#rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens/
+```
+
+
