@@ -4,6 +4,7 @@ library(tidyverse)
 library(synExtra)
 library(readxl)
 library(here)
+library(fuzzyjoin)
 
 synapser::synLogin()
 syn <- synExtra::synDownloader("~/data/DGE_comp/")
@@ -93,23 +94,6 @@ transfer.rc.hms.harvard.edu:/n/files/ImStor/sorger/data/rnaseq/lincs/DGE_fastq_f
 
 ```{r jsm_meta}
 
-# cmp_table <- syn("syn21094266") %>%
-#   read_csv()
-# 
-# cmpd_name_map <- cmp_table %>%
-#   drop_na(pref_name) %>%
-#   transmute(
-#     lspci_id,
-#     name = map2(
-#       pref_name, alt_names,
-#       ~c(
-#         .x,
-#         if (is.na(.y)) NULL else str_split(.y, fixed("|"))[[1]]
-#       )
-#     )
-#   ) %>%
-#   unnest_longer(name)
-
 jsm_meta_raw <- syn("syn21541012") %>%
   read_tsv()
 
@@ -117,9 +101,9 @@ jsm_meta <- jsm_meta_raw %>%
   transmute(
     well = str_replace(Well, "^([A-Z])([1-9])$", "\\10\\2"),
     cells = Cells,
-    stim = Stim,
+    stim = recode(Stim, "0" = "control"),
     stim_conc = `StimConc(inng/mL)`,
-    drug = Drug,
+    drug = recode(Drug, "0" = "control"),
     drug_conc = `DrugConc(inuM)`,
     condition = paste(cells, stim, stim_conc, drug, drug_conc, sep = "_"),
     sample_id = paste("jsm_merck", Plate, well, cells, stim, stim_conc, drug, drug_conc, sep = "_")
@@ -138,7 +122,7 @@ cdk_old_meta <- cdk_old_meta_raw %>%
   transmute(
     well,
     cells = cell_line,
-    drug,
+    drug = recode(drug, "DMSO" = "control"),
     drug_conc = concentration__um,
     condition = paste(cells, drug, drug_conc, sep = "_"),
     sample_id = paste("lincs_cdk4_6_old", well, cells, drug, drug_conc, sep = "_")
@@ -157,7 +141,7 @@ cdk_new_meta <- cdk_new_meta_raw %>%
     plate,
     well,
     cells = cell_line,
-    drug  = agent,
+    drug  = recode(agent, "DMSO" = "control"),
     drug_conc = concentration,
     condition = paste(cells, drug, drug_conc, sep = "_"),
     sample_id = paste("lincs_cdk4_6_7_new", plate, well, cells, drug, drug_conc, sep = "_")
@@ -175,11 +159,43 @@ ld_dub_meta <- ld_dub_raw %>%
   transmute(
     well,
     cells = cellline,
-    drug = agent,
+    drug = recode(agent, "DMSO" = "control"),
     drug_conc = concentration,
     time,
     condition = paste(cells, drug, drug_conc, time, sep = "_"),
     sample_id = paste("ld_dub", well, cells, drug, drug_conc, time, sep = "_")
+  )
+
+```
+
+
+```{r sr_repurposing_meta}
+sr_repurposing_meta_raw1 <- synapser::synGet("syn21546999", followLink = TRUE) %>%
+  chuck("path") %>%
+  read_csv()
+
+sr_repurposing_meta_raw2 <- synapser::synGet("syn21547000", followLink = TRUE) %>%
+  chuck("path") %>%
+  read_csv()
+
+sr_repurposing_meta1 <- sr_repurposing_meta_raw1 %>%
+  transmute(
+    well = Well,
+    cells = "rencell",
+    drug = recode(Drug, "Drug control" = "control"),
+    drug_conc = Concentration,
+    condition = paste(cells, drug, drug_conc, sep = "_"),
+    sample_id = paste("sr_repurposing_old", well, cells, drug, drug_conc, sep = "_")
+  )
+
+sr_repurposing_meta2 <- sr_repurposing_meta_raw2 %>%
+  transmute(
+    well = Well,
+    cells = "rencell",
+    drug = recode(Drug, "DMSO" = "control"),
+    drug_conc = Concentration,
+    condition = paste(cells, drug, drug_conc, sep = "_"),
+    sample_id = paste("sr_repurposing_new", well, cells, drug, drug_conc, sep = "_")
   )
 
 ```
@@ -191,7 +207,9 @@ dataset_syn <- tribble(
   "jsm_merck", "syn21541313",
   "lincs_cdk4_6_old", "syn21541462",
   "ld_dub", "syn21541471",
-  "lincs_cdk4_6_7_new", "syn21541479"
+  "lincs_cdk4_6_7_new", "syn21541479",
+  "sr_repurposing_old", "syn21548149",
+  "sr_repurposing_new", "syn21548150"
 ) %>%
   mutate(
     files = map(
@@ -225,14 +243,6 @@ dataset_syn <- tribble(
     )
   ) %>%
   unnest(files)
-
-# tribble(
-#   ~dataset, ~plate, ~counts, ~count_dupes, ~colnames, ~rownames, ~barcode_counts,
-#   "jsm_merck", 1, "syn21541457", "syn21541454", "syn21541458", "syn21541460", "syn21541800",
-#   "lincs_cdk4_6_old", 1, "syn21541467", "syn21541463", "syn21541468", "syn21541470", "syn21541804",
-#   "ld_dub", 1, "syn21541475", "syn21541472", "syn21541476", "syn21541478", "syn21541808",
-#   
-# )
 
 dataset_files <- dataset_syn %>%
   mutate_at(vars(-dataset, -folder_syn), map_chr, syn)
@@ -311,15 +321,84 @@ meta_all <- tribble(
   "jsm_merck", jsm_meta,
   "lincs_cdk4_6_old", cdk_old_meta,
   "ld_dub", ld_dub_meta,
-  "lincs_cdk4_6_7_new", cdk_new_meta
+  "lincs_cdk4_6_7_new", cdk_new_meta,
+  "sr_repurposing_old", sr_repurposing_meta1,
+  "sr_repurposing_new", sr_repurposing_meta2
 ) %>%
   unnest(meta) %>%
   group_nest(dataset, plate, .key = "meta") %>%
   mutate(plate = if_else(is.na(plate), "1", as.character(plate)))
 
 
+cmp_table <- syn("syn21094266") %>%
+  read_csv()
+
+cmpd_name_map <- cmp_table %>%
+  # drop_na(pref_name) %>%
+  filter(!(is.na(pref_name) & is.na(alt_names))) %>%
+  transmute(
+    lspci_id,
+    name = map2(
+      pref_name, alt_names,
+      ~c(
+        .x,
+        if (is.na(.y)) NULL else str_split(.y, fixed("|"))[[1]]
+      )
+    )
+  ) %>%
+  unnest_longer(name) %>%
+  mutate(name_norm = str_replace_all(name, "-|\\(|\\)|\\s", "") %>% str_to_lower()) %>%
+  distinct()
+
+# meta_cmpd_mapped <- meta_all %>%
+#   unnest(meta) %>%
+#   stringdist_left_join(
+#     cmpd_name_map %>%
+#       distinct(),
+#     by = c("drug" = "name"),
+#     max_dist = 2,
+#     method = "lv",
+#     ignore_case = TRUE,
+#     distance_col = "distance",
+#     nthread = 8
+#   )
+meta_cmpd_mapped <- meta_all %>%
+  unnest(meta) %>%
+  mutate(
+    drug_norm = str_replace_all(drug, "-|\\(|\\)|\\s", "") %>%
+      str_to_lower()
+  ) %>%
+  left_join(
+    cmpd_name_map %>%
+      group_by(name_norm) %>%
+      slice(1) %>%
+      ungroup(),
+    by = c("drug_norm" = "name_norm")
+  ) %>%
+  group_nest(dataset, plate, .key = "meta")
+  # {
+  #   bind_rows(
+  #     filter(., !is.na(lspci_id), str_length(drug_norm) < 5),
+  #     filter(., is.na(lspci_id), str_length(drug_norm) >= 5) %>%
+  #       select(-lspci_id, -name) %>%
+  #       stringdist_left_join(
+  #         cmpd_name_map,
+  #         by = c("drug_norm" = "name_norm"),
+  #         max_dist = 2,
+  #         method = "lv",
+  #         ignore_case = TRUE,
+  #         distance_col = "distance",
+  #         nthread = 8
+  #       )
+  #   )
+  # }
+  
+meta_cmpd_mapped %>%
+  distinct(drug, drug_norm, lspci_id) %>%
+  View()
+
 datasets <- datasets_well %>%
-  inner_join(meta_all, by = c("dataset", "plate")) %>%
+  inner_join(meta_cmpd_mapped, by = c("dataset", "plate")) %>%
   mutate_at(
     vars(-dataset, -plate),
     map2,
@@ -360,6 +439,6 @@ c(
 ) %>%
   synStoreMany(parentId = "syn21542764", activity = activity)
 
-
+#rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens/
 ```
 
