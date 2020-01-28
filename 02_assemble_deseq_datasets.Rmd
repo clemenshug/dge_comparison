@@ -1,0 +1,97 @@
+
+```{r loading, echo=FALSE}
+# library(synExtra)
+library(tidyverse)
+library(biomaRt)
+library(here)
+library(furrr)
+# library(synapser)
+
+synapser::synLogin()
+
+syn <- synExtra::synDownloader("data")
+
+wd <- here("deseq")
+dir.create(wd, showWarnings = FALSE)
+```
+
+# Reading data
+
+
+```{r read_data}
+counts_raw <- syn("syn21544261") %>%
+  read_rds()
+
+```
+
+## Planned analyses
+
+* Fraction of zeros, plot per gene across samples, bulk vs. dge
+* Correlation gene expression, stratified by expression level?
+* Normalize counts with DESeq2
+* UpsetR concordance zeros across cell-lines/treatments
+* Weighted jaccard similarity for comparing similarity of gene sets between
+  drugs
+* Dispersion estimate DGE vs. bulk
+* Concordance differential expression DGE vs. bulk, L1000 genes and not
+
+
+## Normalizing counts
+
+Using DESeq2 to normalize contact counts. Normalizing each batch separately.
+
+```{r deseq_normalization}
+
+samples_passing <- counts_raw %>%
+  transmute(
+    dataset,
+    plate,
+    meta = map2(
+      counts, meta,
+      function(counts, meta) {
+        counts %>%
+          drop_na(sample_id) %>%
+          group_by(sample_id) %>%
+          summarize(total = sum(count)) %>%
+          ungroup() %>%
+          left_join(meta, by = "sample_id") %>%
+          filter(total > 5e4)
+      }
+    ),
+    # Make sure only samples that are included in the metadata table are in count table
+    counts = map2(counts, meta, ~drop_na(.x, sample_id) %>% filter(sample_id %in% .y$sample_id))
+  )
+
+
+data_sets_deseq <- samples_passing %>%
+  # Prepare input meta and count table for DEseq2
+  mutate(
+    meta_deseq = map(
+      meta,
+      ~.x %>%
+        column_to_rownames("sample_id")
+    )
+  ) %>%
+  mutate(
+    counts_deseq = pmap(
+      .,
+      function(meta_deseq, counts, ...) {
+        # browser()
+        counts %>%
+          dplyr::select(ensembl_gene_id, sample_id, count) %>%
+          filter(sample_id %in% rownames(meta_deseq)) %>%
+          spread(sample_id, count) %>%
+          mutate_at(vars(-ensembl_gene_id), replace_na, replace = 0) %>%
+          column_to_rownames("ensembl_gene_id") %>%
+          as.matrix()
+      }
+    )
+  )
+
+write_rds(
+  data_sets_deseq,
+  here("deseq", "deseq_input.rds")
+)
+```
+
+
