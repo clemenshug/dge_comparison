@@ -4,7 +4,6 @@ library(tidyverse)
 library(synExtra)
 library(readxl)
 library(here)
-library(fuzzyjoin)
 
 synapser::synLogin()
 syn <- synExtra::synDownloader("~/data/DGE_comp/")
@@ -99,16 +98,14 @@ jsm_meta_raw <- syn("syn21541012") %>%
 
 jsm_meta <- jsm_meta_raw %>%
   transmute(
+    plate = 1,
     well = str_replace(Well, "^([A-Z])([1-9])$", "\\10\\2"),
     cells = Cells,
     stim = recode(Stim, "0" = "control"),
     stim_conc = `StimConc(inng/mL)`,
     drug = recode(Drug, "0" = "control"),
-    drug_conc = `DrugConc(inuM)`,
-    condition = paste(cells, stim, stim_conc, drug, drug_conc, sep = "_"),
-    sample_id = paste("jsm_merck", Plate, well, cells, stim, stim_conc, drug, drug_conc, sep = "_")
+    drug_conc = `DrugConc(inuM)`
   )
-
 
 ```
 
@@ -120,12 +117,11 @@ cdk_old_meta_raw <- synapser::synGet("syn21542403", followLink = TRUE) %>%
 
 cdk_old_meta <- cdk_old_meta_raw %>%
   transmute(
+    plate = 1,
     well,
     cells = cell_line,
     drug = recode(drug, "DMSO" = "control"),
-    drug_conc = concentration__um,
-    condition = paste(cells, drug, drug_conc, sep = "_"),
-    sample_id = paste("lincs_cdk4_6_old", well, cells, drug, drug_conc, sep = "_")
+    drug_conc = concentration__um
   )
 
 ```
@@ -142,9 +138,7 @@ cdk_new_meta <- cdk_new_meta_raw %>%
     well,
     cells = cell_line,
     drug  = recode(agent, "DMSO" = "control"),
-    drug_conc = concentration,
-    condition = paste(cells, drug, drug_conc, sep = "_"),
-    sample_id = paste("lincs_cdk4_6_7_new", plate, well, cells, drug, drug_conc, sep = "_")
+    drug_conc = concentration
   )
 
 ```
@@ -157,13 +151,12 @@ ld_dub_raw <- synapser::synGet("syn21542711", followLink = TRUE) %>%
 
 ld_dub_meta <- ld_dub_raw %>%
   transmute(
+    plate = 1,
     well,
     cells = cellline,
     drug = recode(agent, "DMSO" = "control"),
     drug_conc = concentration,
-    time,
-    condition = paste(cells, drug, drug_conc, time, sep = "_"),
-    sample_id = paste("ld_dub", well, cells, drug, drug_conc, time, sep = "_")
+    time
   )
 
 ```
@@ -180,22 +173,22 @@ sr_repurposing_meta_raw2 <- synapser::synGet("syn21547000", followLink = TRUE) %
 
 sr_repurposing_meta1 <- sr_repurposing_meta_raw1 %>%
   transmute(
+    plate = 1,
     well = Well,
     cells = "rencell",
     drug = recode(Drug, "Drug control" = "control"),
-    drug_conc = Concentration,
-    condition = paste(cells, drug, drug_conc, sep = "_"),
-    sample_id = paste("sr_repurposing_old", well, cells, drug, drug_conc, sep = "_")
+    drug_conc = Concentration %>%
+      magrittr::inset(is.na(.), 0)
   )
 
 sr_repurposing_meta2 <- sr_repurposing_meta_raw2 %>%
   transmute(
+    plate = 1,
     well = Well,
     cells = "rencell",
     drug = recode(Drug, "DMSO" = "control"),
-    drug_conc = Concentration,
-    condition = paste(cells, drug, drug_conc, sep = "_"),
-    sample_id = paste("sr_repurposing_new", well, cells, drug, drug_conc, sep = "_")
+    drug_conc = Concentration %>%
+      magrittr::inset(is.na(.), 0)
   )
 
 ```
@@ -203,13 +196,13 @@ sr_repurposing_meta2 <- sr_repurposing_meta_raw2 %>%
 
 ```{r counts}
 dataset_syn <- tribble(
-  ~dataset, ~folder_syn,
-  "jsm_merck", "syn21541313",
-  "lincs_cdk4_6_old", "syn21541462",
-  "ld_dub", "syn21541471",
-  "lincs_cdk4_6_7_new", "syn21541479",
-  "sr_repurposing_old", "syn21548149",
-  "sr_repurposing_new", "syn21548150"
+  ~dataset, ~folder_syn, ~batch,
+  "jsm_merck", "syn21541313", "2017_09",
+  "lincs_cdk4_6_7", "syn21541462", "2017_09",
+  "ld_dub", "syn21541471", "2018_06",
+  "lincs_cdk4_6_7", "syn21541479", "2019_08",
+  "sr_repurposing", "syn21548149", "2018_02",
+  "sr_repurposing", "syn21548150", "2018_11"
 ) %>%
   mutate(
     files = map(
@@ -245,7 +238,7 @@ dataset_syn <- tribble(
   unnest(files)
 
 dataset_files <- dataset_syn %>%
-  mutate_at(vars(-dataset, -folder_syn), map_chr, syn)
+  mutate_at(vars(-dataset, -folder_syn, -batch), map_chr, syn)
 
 datasets_raw <- dataset_files %>%
   mutate_at(
@@ -294,12 +287,17 @@ ensembl_gene_id_mapping_biomart <- biomaRt::select(
   filter(gene_biotype == "protein_coding") %>%
   mutate(hgnc_symbol = magrittr::inset(hgnc_symbol, hgnc_symbol == "", NA_character_)) %>%
   rename(symbol = hgnc_symbol) %>%
-  select(-gene_biotype)
+  select(-gene_biotype) %>%
+  # keep only a single symbol per ensembl_gene_id
+  group_by(ensembl_gene_id) %>%
+  slice(1) %>%
+  ungroup()
 
 datasets_well <- datasets_raw %>%
   transmute(
     dataset,
     plate,
+    batch,
     counts = pmap(
       list(counts, colnames, rownames),
       prepare_counts,
@@ -317,18 +315,39 @@ datasets_well <- datasets_raw %>%
 
 ```{r datasets_with_meta}
 meta_all <- tribble(
-  ~dataset, ~meta,
-  "jsm_merck", jsm_meta,
-  "lincs_cdk4_6_old", cdk_old_meta,
-  "ld_dub", ld_dub_meta,
-  "lincs_cdk4_6_7_new", cdk_new_meta,
-  "sr_repurposing_old", sr_repurposing_meta1,
-  "sr_repurposing_new", sr_repurposing_meta2
+  ~dataset, ~meta, ~batch,
+  "jsm_merck", jsm_meta, "2017_09",
+  "lincs_cdk4_6_7", cdk_old_meta, "2017_09",
+  "ld_dub", ld_dub_meta, "2018_06",
+  "lincs_cdk4_6_7", cdk_new_meta, "2019_08",
+  "sr_repurposing", sr_repurposing_meta1, "2018_02",
+  "sr_repurposing", sr_repurposing_meta2, "2018_11",
 ) %>%
+  mutate(
+    meta = map2(
+      meta, dataset,
+      ~.x %>%
+        mutate(
+          condition = do.call(
+            paste,
+            as.list(.x)[c("cells", "stim", "stim_conc", "drug", "drug_conc", "time")] %>%
+              magrittr::inset2("sep", "_")
+          ),
+          sample_id = paste(.y, plate, well, condition, sep = "_"),
+          control_condition = do.call(
+            paste,
+            as.list(.x)[c("cells", "stim", "stim_conc", "drug", "drug_conc", "time")] %>%
+              magrittr::inset2("drug", "control") %>%
+              magrittr::inset2("drug_conc", 0) %>%
+              magrittr::inset2("sep", "_")
+          ) %>%
+            magrittr::inset(!(. %in% condition), NA_character_)
+        )
+    )
+  ) %>%
   unnest(meta) %>%
   group_nest(dataset, plate, .key = "meta") %>%
   mutate(plate = if_else(is.na(plate), "1", as.character(plate)))
-
 
 cmp_table <- syn("syn21094266") %>%
   read_csv()
@@ -350,18 +369,7 @@ cmpd_name_map <- cmp_table %>%
   mutate(name_norm = str_replace_all(name, "-|\\(|\\)|\\s", "") %>% str_to_lower()) %>%
   distinct()
 
-# meta_cmpd_mapped <- meta_all %>%
-#   unnest(meta) %>%
-#   stringdist_left_join(
-#     cmpd_name_map %>%
-#       distinct(),
-#     by = c("drug" = "name"),
-#     max_dist = 2,
-#     method = "lv",
-#     ignore_case = TRUE,
-#     distance_col = "distance",
-#     nthread = 8
-#   )
+
 meta_cmpd_mapped <- meta_all %>%
   unnest(meta) %>%
   mutate(
@@ -375,32 +383,12 @@ meta_cmpd_mapped <- meta_all %>%
       ungroup(),
     by = c("drug_norm" = "name_norm")
   ) %>%
-  group_nest(dataset, plate, .key = "meta")
-  # {
-  #   bind_rows(
-  #     filter(., !is.na(lspci_id), str_length(drug_norm) < 5),
-  #     filter(., is.na(lspci_id), str_length(drug_norm) >= 5) %>%
-  #       select(-lspci_id, -name) %>%
-  #       stringdist_left_join(
-  #         cmpd_name_map,
-  #         by = c("drug_norm" = "name_norm"),
-  #         max_dist = 2,
-  #         method = "lv",
-  #         ignore_case = TRUE,
-  #         distance_col = "distance",
-  #         nthread = 8
-  #       )
-  #   )
-  # }
-  
-meta_cmpd_mapped %>%
-  distinct(drug, drug_norm, lspci_id) %>%
-  View()
+  group_nest(dataset, plate, batch, .key = "meta")
 
 datasets <- datasets_well %>%
-  inner_join(meta_cmpd_mapped, by = c("dataset", "plate")) %>%
+  inner_join(meta_cmpd_mapped, by = c("dataset", "plate", "batch")) %>%
   mutate_at(
-    vars(-dataset, -plate),
+    vars(counts, count_dupes, barcode_counts),
     map2,
     .$meta,
     ~.x %>%
@@ -408,13 +396,13 @@ datasets <- datasets_well %>%
         select(.y, well, sample_id),
         by = "well"
       )
-  ) %>%
-  select(-meta)
+  )
 
 
 write_rds(
   datasets,
-  file.path(wd, "counts_raw.rds")
+  file.path(wd, "counts_raw.rds"),
+  compress = "gz"
 )
 
 ```
@@ -428,7 +416,7 @@ activity <- synapser::Activity(
     "syn21542403",
     "syn21542711",
     dataset_syn %>%
-      select(-dataset, -folder_syn, -plate) %>%
+      select(-dataset, -folder_syn, -plate, -batch) %>%
       reduce(union)
   ),
   executed = "https://github.com/clemenshug/dge_comparison/blob/master/wrangling/09_dge_datasets.Rmd"

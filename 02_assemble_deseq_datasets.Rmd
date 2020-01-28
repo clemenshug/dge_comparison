@@ -46,6 +46,7 @@ samples_passing <- counts_raw %>%
   transmute(
     dataset,
     plate,
+    batch,
     meta = map2(
       counts, meta,
       function(counts, meta) {
@@ -90,7 +91,8 @@ data_sets_deseq <- samples_passing %>%
 
 write_rds(
   data_sets_deseq,
-  here("deseq", "deseq_input.rds")
+  here("deseq", "deseq_input.rds"),
+  compress = "gz"
 )
 ```
 
