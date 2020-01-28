@@ -9,6 +9,11 @@ output: html_document
 library(tidyverse)
 library(cmapR)
 library(webchem)
+library(synExtra)
+library(here)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("~/data/DGE_comp/")
 ```
 
 ## CMap data
@@ -25,27 +30,59 @@ pertubation_meta_raw <- list(
   map(read_tsv, na = "-666") %>%
   bind_rows(.id = "dataset")
 
-pubchem_ids <- pertubation_meta_raw %>%
-  distinct(inchi_key) %>%
-  drop_na() %>%
-  mutate(pubchem_cid = get_cid(inchi_key, from = "inchikey", verbose = FALSE))
+# pubchem_ids <- pertubation_meta_raw %>%
+#   distinct(inchi_key) %>%
+#   drop_na() %>%
+#   mutate(pubchem_cid = get_cid(inchi_key, from = "inchikey", verbose = FALSE))
 
-pertubation_meta <- pertubation_meta_raw %>%
-  left_join(pubchem_ids, by = "inchi_key") %>%
-  # Some compounds in the original dataset already have pubchem ids, merging
-  # them with the fetched ones
-  mutate(
-    pubchem_cid = map2(
-      pubchem_cid.x, pubchem_cid.y,
-      ~unique(c(.x, .y)) %>%
-        # Remove NA values if there is a non-NA value
-        {if (sum(!is.na(.)) > 0) na.omit(.) else .}
+cmp_table <- syn("syn21094266") %>%
+  read_csv()
+
+cmpd_name_map <- cmp_table %>%
+  # drop_na(pref_name) %>%
+  filter(!(is.na(pref_name) & is.na(alt_names))) %>%
+  transmute(
+    lspci_id,
+    name = map2(
+      pref_name, alt_names,
+      ~c(
+        .x,
+        if (is.na(.y)) NULL else str_split(.y, fixed("|"))[[1]]
+      )
     )
   ) %>%
-  select(-pubchem_cid.x, -pubchem_cid.y) %>%
-  unnest(pubchem_cid)
+  unnest_longer(name) %>%
+  mutate(name_norm = str_replace_all(name, "-|\\(|\\)|\\s", "") %>% str_to_lower()) %>%
+  distinct()
 
-write_csv(pertubation_meta, file.path("..", "wrangled", "cmap_perturbation_meta.csv.gz"))
+pertubation_meta <- pertubation_meta_raw %>%
+  mutate(
+    pert_iname_norm = str_replace_all(pert_iname, "-|\\(|\\)|\\s", "") %>% str_to_lower()
+  ) %>%
+  left_join(
+    cmpd_name_map %>%
+      group_by(name_norm) %>%
+      slice(1) %>%
+      ungroup(),
+    by = c("pert_iname_norm" = "name_norm")
+  )
+  # left_join(pubchem_ids, by = "inchi_key") %>%
+  # # Some compounds in the original dataset already have pubchem ids, merging
+  # # them with the fetched ones
+  # mutate(
+  #   pubchem_cid = map2(
+  #     pubchem_cid.x, pubchem_cid.y,
+  #     ~unique(c(.x, .y)) %>%
+  #       # Remove NA values if there is a non-NA value
+  #       {if (sum(!is.na(.)) > 0) na.omit(.) else .}
+  #   )
+  # ) %>%
+  # select(-pubchem_cid.x, -pubchem_cid.y) %>%
+  # unnest(pubchem_cid)
+
+pertubation_meta %>% filter(!is.na(lspci_id))
+
+write_csv(pertubation_meta, here("wrangled", "cmap_perturbation_meta.csv.gz"))
 ```
 
 
@@ -75,7 +112,7 @@ signature_meta_raw <- list(
 # signatures, so ignore...
 
 signature_meta <- signature_meta_raw %>%
-  left_join(select(pertubation_meta, pert_id, pubchem_cid), by = "pert_id")
+  left_join(select(pertubation_meta, pert_id, lspci_id), by = "pert_id")
 
 write_csv(signature_meta, file.path("..", "wrangled", "cmap_signature_meta.csv.gz"))
 ```
@@ -124,10 +161,10 @@ activity <- synapser::Activity(
 )
 
 c(
-  file.path("..", "wrangled", "cmap_perturbation_meta.csv.gz"),
-  file.path("..", "wrangled", "cmap_instance_meta.csv.gz"),
-  file.path("..", "wrangled", "cmap_signature_meta.csv.gz"),
-  file.path("..", "wrangled", "cmap_gene_meta.csv.gz")
+  here("wrangled", "cmap_perturbation_meta.csv.gz"),
+  here("wrangled", "cmap_instance_meta.csv.gz"),
+  here("wrangled", "cmap_signature_meta.csv.gz"),
+  here("wrangled", "cmap_gene_meta.csv.gz")
 ) %>%
   synStoreMany(parentId = "syn21547022", activity = activity)
 
