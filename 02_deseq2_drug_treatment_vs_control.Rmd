@@ -13,6 +13,9 @@ library(UpSetR)
 library(here)
 library(furrr)
 
+synapser::synLogin()
+syn <- synExtra::synDownloader("~/data/DGE_comp/")
+
 paste_ <- function(...) {
   paste(..., sep = "_")
 }
@@ -22,7 +25,7 @@ Calculating differentially expressed genes between drug treatment conditions
 and control for DGE and bulk RNA-seq separately.
 
 ```{r read_data}
-deseq_input <- here("deseq", "deseq_input.rds") %>%
+deseq_input <- syn("syn21558154") %>%
   read_rds()
 ```
 
@@ -136,7 +139,7 @@ comp_deseqs <- comps_inputs %>%
     )
   )
 
-plan(multisession(workers = 10))
+plan(multisession(workers = 4))
 comp_deseqs_calc <- comp_deseqs %>%
   # dplyr::rename(meta = deseq_meta) %>%
   mutate(
@@ -180,7 +183,8 @@ comp_res <- comp_deseqs_calc %>%
 #   select(name, method, cell_line, drug, concentration, time, result)
 write_rds(
   comp_res,
-  here("deseq", "deseq_treatment_vs_control_result.rds")
+  here("deseq", "deseq_treatment_vs_control_result.rds"),
+  compress = "gz"
 )
 
 ```
@@ -315,7 +319,7 @@ unloadNamespace("PythonEmbedInR")
 
 # plan(multisession(workers = 4))
 # options(future.globals.maxSize = 1500 * 1024**2)
-comp_res_calc <- comp_deseqs_conc_calc %>%
+comp_res_conc <- comp_deseqs_conc_calc %>%
   mutate(
     result = map(
       deseq,
@@ -339,12 +343,31 @@ comp_res_calc <- comp_deseqs_conc_calc %>%
 # comp_res_df <- comp_res %>%
 #   select(name, method, cell_line, drug, concentration, time, result)
 write_rds(
-  comp_res_calc,
-  here("deseq", "deseq_treatment_vs_control_result.rds")
+  comp_res_conc,
+  here("deseq", "deseq_treatment_vs_control_conc_result.rds"),
+  compress = "gz"
 )
 
 
 ```
 
 
+
+```{r synapse}
+activity <- synapser::Activity(
+  name = "Run DESeq2",
+  used = c(
+    "syn21558154"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/02_deseq2_drug_treatment_vs_control.Rmd"
+)
+
+c(
+  here("deseq", "deseq_treatment_vs_control_result.rds"),
+  here("deseq", "deseq_treatment_vs_control_conc_result.rds")
+) %>%
+  synStoreMany(parentId = "syn21558153", activity = activity)
+
+#rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens/
+```
 
