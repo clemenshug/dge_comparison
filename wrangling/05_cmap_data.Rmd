@@ -11,10 +11,20 @@ library(cmapR)
 library(webchem)
 library(synExtra)
 library(here)
+library(lspcheminf)
+library(furrr)
 
 synapser::synLogin()
 syn <- synExtra::synDownloader("~/data/DGE_comp/")
 ```
+
+
+```{r compound_info}
+compound_dict <- syn("syn21094266") %>%
+  read_csv()
+
+```
+
 
 ## CMap data
 
@@ -30,41 +40,102 @@ pertubation_meta_raw <- list(
   map(read_tsv, na = "-666") %>%
   bind_rows(.id = "dataset")
 
-# pubchem_ids <- pertubation_meta_raw %>%
-#   distinct(inchi_key) %>%
-#   drop_na() %>%
-#   mutate(pubchem_cid = get_cid(inchi_key, from = "inchikey", verbose = FALSE))
+unique_compounds <- pertubation_meta_raw %>%
+  drop_na(canonical_smiles) %>%
+  distinct(pert_id, smiles = canonical_smiles) %>%
+  left_join(
+    convert_compound_identifier(
+      set_names(.$smiles, .$pert_id),
+      identifier = "smiles",
+      target_identifier = "inchi"
+    ) %>%
+      select(inchi = compounds, pert_id = names),
+    by = "pert_id"
+  )
 
-cmp_table <- syn("syn21094266") %>%
-  read_csv()
-
-cmpd_name_map <- cmp_table %>%
-  # drop_na(pref_name) %>%
-  filter(!(is.na(pref_name) & is.na(alt_names))) %>%
-  transmute(
-    lspci_id,
-    name = map2(
-      pref_name, alt_names,
-      ~c(
-        .x,
-        if (is.na(.y)) NULL else str_split(.y, fixed("|"))[[1]]
-      )
-    )
+plan(multisession(workers = 4))
+unique_compounds_canonical <- unique_compounds %>%
+  distinct(pert_id, inchi) %>%
+  drop_na() %>%
+  chunk_df(12) %>%
+  future_map(
+    ~left_join(
+      .x,
+      canonicalize_compound(
+        set_names(.x$inchi, .x$pert_id),
+        standardize = TRUE
+      ) %>%
+        select(pert_id = compound, canonical_inchi = inchi),
+      by = "pert_id"
+    ),
+    .progress = TRUE
   ) %>%
-  unnest_longer(name) %>%
-  mutate(name_norm = str_replace_all(name, "-|\\(|\\)|\\s", "") %>% str_to_lower()) %>%
-  distinct()
+  bind_rows()
+
+compound_dict_chunks <- compound_dict %>%
+  drop_na(inchi) %>%
+  select(lspci_id, inchi) %>%
+  chunk_df(10) %>%
+  enframe("chunk_id", "data")
+
+compound_lspci_id_mapping <- compound_dict_chunks %>%
+  crossing(fingerprint_type = c("morgan", "topological")) %>%
+  mutate(
+    data = future_map2(
+      data, fingerprint_type,
+      ~chemical_similarity_threshold(
+        unique_compounds_canonical %>%
+          drop_na(canonical_inchi) %>%
+          distinct(pert_id, canonical_inchi) %>%
+          {set_names(.$canonical_inchi, .$pert_id)},
+        .x %>%
+          {set_names(.$inchi, .$lspci_id)},
+          # head(100000),
+        threshold = 1,
+        fingerprint_type = .y,
+        url = "http://192.168.56.101:8000"
+      ),
+      .progress = TRUE
+    )
+  )
+
+# compound_dict_mw <- compound_dict_chunks %>%
+#  mutate(
+#    mw = future_map(
+#      data,
+#      ~lspcheminf::molecular_mass(
+#        set_names(.x$inchi, .x$lspci_id)
+#      ),
+#      .progress = TRUE
+#    )
+#  )
+
+
+compound_lspci_id_mapping_df <- compound_lspci_id_mapping %>%
+  select(data, fingerprint_type) %>%
+  unnest(data) %>%
+  group_by(query) %>%
+  filter(
+    n() == 2,
+    all(c("morgan", "topological") %in% fingerprint_type),
+    length(unique(target)) == 1
+  ) %>%
+  ungroup() %>%
+  distinct(pert_id = query, lspci_id = target)
+
+
+write_csv(
+  compound_lspci_id_mapping_df,
+  here("wrangled", "cmap_pertubation_compound_mapping.csv")
+)
 
 pertubation_meta <- pertubation_meta_raw %>%
   mutate(
-    pert_iname_norm = str_replace_all(pert_iname, "-|\\(|\\)|\\s", "") %>% str_to_lower()
+    pert_iname_norm = str_replace_all(pert_iname, "[^a-zA-Z\\d]", "") %>% str_to_lower()
   ) %>%
   left_join(
-    cmpd_name_map %>%
-      group_by(name_norm) %>%
-      slice(1) %>%
-      ungroup(),
-    by = c("pert_iname_norm" = "name_norm")
+    compound_lspci_id_mapping_df,
+    by = "pert_id"
   )
   # left_join(pubchem_ids, by = "inchi_key") %>%
   # # Some compounds in the original dataset already have pubchem ids, merging
@@ -80,7 +151,7 @@ pertubation_meta <- pertubation_meta_raw %>%
   # select(-pubchem_cid.x, -pubchem_cid.y) %>%
   # unnest(pubchem_cid)
 
-pertubation_meta %>% filter(!is.na(lspci_id))
+# pertubation_meta %>% filter(!is.na(lspci_id))
 
 write_csv(pertubation_meta, here("wrangled", "cmap_perturbation_meta.csv.gz"))
 ```
@@ -96,22 +167,32 @@ instance_meta_raw <- list(
   bind_rows(.id = "dataset")
 
 instance_meta <- instance_meta_raw %>%
-  left_join(select(pertubation_meta, pert_id, pubchem_cid), by = "pert_id")
+  left_join(select(pertubation_meta, pert_id, pubchem_cid, lspci_id), by = "pert_id")
 
 write_csv(instance_meta, file.path("..", "wrangled", "cmap_instance_meta.csv.gz"))
 ```
+
+
+
 
 ```{r signature_meta}
 signature_meta_raw <- list(
   GSE92742 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_sig_info.txt.gz",
   GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_sig_info_2017-03-06.txt.gz"
 ) %>%
-  map(read_tsv, na = "-666") %>%
+  map(read_tsv, na = c("-666", "-666.00")) %>%
   bind_rows(.id = "dataset")
 # Parsing failures correspond to malformed fields in input data, are in irrelevant
 # signatures, so ignore...
 
 signature_meta <- signature_meta_raw %>%
+  mutate(
+    pert_dose = if_else(is.na(pert_dose), as.double(str_match(pert_idose, "([\\d\\.]+) um")[, 2]), pert_dose) %>%
+      {if_else(. < 0, NA_real_, .)},
+    pert_dose_unit = if_else(str_detect(pert_idose, "([\\d\\.]+) um"), "µM", pert_dose_unit),
+    pert_time = if_else(is.na(pert_time), as.double(str_match(pert_itime, "([\\d]+) h")[, 2]), pert_time),
+    pert_time_unit = if_else(is.na(pert_itime), NA_character_, "h")
+  ) %>%
   left_join(select(pertubation_meta, pert_id, lspci_id), by = "pert_id")
 
 write_csv(signature_meta, file.path("..", "wrangled", "cmap_signature_meta.csv.gz"))
