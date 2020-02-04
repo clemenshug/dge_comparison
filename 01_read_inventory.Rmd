@@ -13,7 +13,8 @@ dir.create(wd, showWarnings = FALSE)
 
 
 ```{r loading}
-datasets <- read_rds(here("wrangled", "datasets_raw.rds"))
+datasets <- syn("syn21544261") %>%
+  read_rds()
 
 fastq_counts <- syn("syn21542323") %>%
   read_csv()
@@ -36,19 +37,19 @@ count_stats <- datasets %>%
 
 dataset_stats <- count_stats %>%
   drop_na(sample_id) %>%
-  group_by(dataset, plate, count_type) %>%
+  group_by(dataset, batch, plate, count_type) %>%
   summarize(count = sum(count)) %>%
   ungroup() %>%
   mutate_at(vars(plate), as.numeric) %>%
   bind_rows(
     fastq_counts %>%
-      transmute(dataset, plate, count_type = "fastq_count", count = fastq_count)
+      transmute(dataset, batch, plate, count_type = "fastq_count", count = fastq_count)
   ) %>%
   mutate(
     count_type = factor(count_type, levels = c("fastq_count", "barcode_counts", "count_dupes", "counts"))
   ) %>%
-  arrange(dataset, plate, count_type) %>%
-  group_by(dataset, plate) %>%
+  arrange(dataset, batch, plate, count_type) %>%
+  group_by(dataset, batch, plate) %>%
   mutate(
     count_fraction = count / count[[1]],
     count_prev_fraction = count / c(count[[1]], head(count, -1)),
@@ -57,21 +58,22 @@ dataset_stats <- count_stats %>%
   ) %>%
   ungroup()
 
-combined_stats <- count_stats %>%
+# combined_stats <- count_stats %>%
   
 
 ```
 
 
 ```{r plot_count_stats}
+
 dataset_names <- tribble(
-  ~dataset, ~dataset_name,
-  "jsm_merck", "2017_09_john_santa_maria_merck_drugs",
-  "lincs_cdk4_6_old", "2017_09_lincs_cdk4_6_inhibitors",
-  "sr_repurposing_old", "2018_02_steven_rodriguez_ad_repurposing",
-  "ld_dub", "2018_06_laura_doherty_dub_inhibitors",
-  "sr_repurposing_new", "2018_11_steven_rodriguez_ad_repurposing",
-  "lincs_cdk4_6_7_new", "2019_08_lincs_cdk4_6_7_inhibitors"
+  ~dataset, ~dataset_name, ~batch,
+  "jsm_merck", "2017_09_john_santa_maria_merck_drugs", "2017_09",
+  "lincs_cdk4_6_7", "2017_09_lincs_cdk4_6_inhibitors", "2017_09",
+  "ld_dub", "2018_06_laura_doherty_dub_inhibitors", "2018_06",
+  "lincs_cdk4_6_7", "2019_08_lincs_cdk4_6_7_inhibitors", "2019_08",
+  "sr_repurposing", "2018_02_steven_rodriguez_ad_repurposing", "2018_02",
+  "sr_repurposing", "2018_11_steven_rodriguez_ad_repurposing", "2018_11",
 ) %>%
   mutate(
     dataset_name = as.factor(dataset_name) %>%
@@ -122,6 +124,22 @@ dataset_remaining_stats_bars <- dataset_stats %>%
 ggsave(
   file.path(wd, "cumulative_fraction_reads_bar.png"),
   dataset_remaining_stats_bars, width = 8, height = 4
+)
+
+dataset_stats_bars_abs <- dataset_stats %>%
+  inner_join(dataset_names) %>%
+  inner_join(count_names) %>%
+  mutate(dataset_name = fct_cross(dataset_name, as.factor(plate) %>% fct_inseq(), sep = "_")) %>%
+  ggplot(aes(dataset_name, count, fill = count_type_name)) +
+    geom_col(position = "dodge") +
+    coord_flip() +
+    scale_fill_discrete(breaks = rev(levels(count_names$count_type_name))) +
+    # scale_y_discrete(limits = rev(levels(count_names$count_type_name))) +
+    labs(y = "Number of reads", x = "Dataset", fill = "")
+
+ggsave(
+  file.path(wd, "absolute_reads_bar.png"),
+  dataset_stats_bars_abs, width = 8, height = 4
 )
 
 
