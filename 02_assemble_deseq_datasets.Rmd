@@ -1,6 +1,6 @@
 
 ```{r loading, echo=FALSE}
-# library(synExtra)
+library(synExtra)
 library(tidyverse)
 library(biomaRt)
 library(here)
@@ -97,3 +97,20 @@ write_rds(
 ```
 
 
+
+```{r synapse}
+activity <- synapser::Activity(
+  name = "Wrangle DGE data",
+  used = c(
+    "syn21544261"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/02_assemble_deseq_datasets.Rmd"
+)
+
+c(
+  here("deseq", "deseq_input.rds")
+) %>%
+  synStoreMany(parentId = "syn21558153", activity = activity)
+
+#rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens/
+```
