@@ -349,39 +349,44 @@ meta_all <- tribble(
   group_nest(dataset, plate, .key = "meta") %>%
   mutate(plate = if_else(is.na(plate), "1", as.character(plate)))
 
-cmp_table <- syn("syn21094266") %>%
+cmpd_name_map <- syn("syn21586544") %>%
   read_csv()
 
-cmpd_name_map <- cmp_table %>%
-  # drop_na(pref_name) %>%
-  filter(!(is.na(pref_name) & is.na(alt_names))) %>%
-  transmute(
-    lspci_id,
-    name = map2(
-      pref_name, alt_names,
-      ~c(
-        .x,
-        if (is.na(.y)) NULL else str_split(.y, fixed("|"))[[1]]
-      )
-    )
-  ) %>%
-  unnest_longer(name) %>%
-  mutate(name_norm = str_replace_all(name, "-|\\(|\\)|\\s", "") %>% str_to_lower()) %>%
-  distinct()
+cmpd_dict <- syn("syn21094266") %>%
+  read_csv()
 
+cmpd_name_map_norm <- cmpd_name_map %>%
+  distinct(
+    lspci_id,
+    name = str_to_lower(name) %>%
+      str_replace_all("[^a-zA-Z0-9]", "")
+  )
+
+cmdps_mapped <- meta_all %>%
+  unnest(meta) %>%
+  distinct(
+    drug_norm = str_to_lower(drug) %>%
+      str_replace_all("[^a-zA-Z0-9]", "")
+  ) %>%
+  left_join(
+    cmpd_name_map_norm,
+    by = c("drug_norm" = "name")
+  ) %>%
+  filter(lspci_id != 78695)
+
+# Barasertib appears twice in Chembl (CHEMBL415049 and CHEMBL215152)
+# CHEMBL215152 is most likely a mistake
+# keeping only CHEMBL415049 (lspci_id 50430), discarding CHEMBL215152 (lspci_id 78695)
 
 meta_cmpd_mapped <- meta_all %>%
   unnest(meta) %>%
   mutate(
-    drug_norm = str_replace_all(drug, "-|\\(|\\)|\\s", "") %>%
-      str_to_lower()
+    drug_norm = str_to_lower(drug) %>%
+      str_replace_all("[^a-zA-Z0-9]", "")
   ) %>%
   left_join(
-    cmpd_name_map %>%
-      group_by(name_norm) %>%
-      slice(1) %>%
-      ungroup(),
-    by = c("drug_norm" = "name_norm")
+    cmdps_mapped,
+    by = "drug_norm"
   ) %>%
   group_nest(dataset, plate, batch, .key = "meta")
 
@@ -415,6 +420,8 @@ activity <- synapser::Activity(
     "syn21541012",
     "syn21542403",
     "syn21542711",
+    "syn21586544",
+    "syn21094266",
     dataset_syn %>%
       select(-dataset, -folder_syn, -plate, -batch) %>%
       reduce(union)
