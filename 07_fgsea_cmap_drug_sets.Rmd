@@ -1,0 +1,228 @@
+---
+title: "Query Clue CMap drug sets"
+author: "Clemens Hug"
+date: "7/2/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(genebabel)
+library(clueR)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("data")
+```
+
+## Goal
+
+Query 
+
+
+
+```{r loading}
+comp_res_raw <- syn("syn21559856") %>%
+  read_rds()
+
+comp_res_conc_raw <- syn("syn21559859") %>%
+  read_rds()
+
+signature_meta <- syn("syn21547101") %>%
+  read_csv()
+
+cmap_gene_meta <- syn("syn21547102") %>%
+  read_csv()
+
+```
+
+Only querying using highest concentration and latest time.
+
+```{r querying_cmap}
+comp_res_selected <- comp_res_conc_raw
+  # arrange(desc(time)) %>%
+  # group_by(dataset, drug, cells, time) %>%
+  # slice(1) %>%
+  # ungroup()
+
+library(genebabel)
+
+comp_res_entrez <- comp_res_selected %>%
+  mutate(
+    result = map(
+      result,
+      function(df) {
+        df %>%
+          join_hgnc("ensembl_gene_id", "ensembl_gene_id", "entrez_id") %>%
+          # select(-symbol) %>%
+          dplyr::rename(gene_id = entrez_id)
+      }
+    )
+  )
+
+
+comp_res_clue <- comp_res_entrez %>%
+  filter(
+    map_lgl(result, ~nrow(filter(.x, padj < 0.05)) > 20)
+  )  %>%
+  mutate(
+    gene_set = paste(dataset, drug, cells, stim, stim_conc, time, sep = "_") %>%
+      str_replace_all("\\s", "_") %>%
+      str_replace_all("[^\\w]", ""),
+    result_prepped = map2(
+      result, gene_set,
+      possibly(clue_gmt_from_deseq2, NULL),
+      alpha = 0.05
+    )
+  ) %>%
+  filter(map_lgl(result_prepped, negate(is.null)))
+  # filter(
+  #   map_lgl(result_prepped, ~nrow(.x) > 20)
+  # )
+
+MAX_PER_QUERY = 25
+comp_res_gene_sets <- comp_res_clue %>%
+  unchop(result_prepped)
+  # split(sample(seq_len(MAX_PER_QUERY), nrow(.), replace = TRUE)) %>%
+  split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
+  map("result_prepped") %>%
+  map() 
+%>%
+  map(clue_gmt_from_df)
+
+comp_res_submission <- map(comp_res_gene_sets, ~tibble(!!!.x)) %>%
+  bind_rows() %>%
+  mutate(job_name = paste("all_drugs_2019_07_02", seq_len(n()), sep = "_"))
+
+session <- clue_start_session("028cf7031b72b87ea62dfc08e98b530e")
+
+pwalk(
+  comp_res_submission,
+  function(up, down, job_name) {
+    clue_submit_query(
+      session,
+      job_name,
+      up, down
+    )
+  }
+)
+
+```
+
+```{r process_results}
+results_files <- list.files(file.path("cmap_overlap", "query_results"), full.names = TRUE)
+
+query_results_pcl <- results_files %>%
+  map(clue_parse_result, score_type = "tau", result_type = "pcl") %>%
+  reduce(full_join, by = "id", suffix = c("", ".y")) %>%
+  select(-matches("pert_.*\\..*"), -starts_with("pcl_size.")) %>%
+  gather("gene_set", "normalized_score", -id, -pcl_size)
+
+
+query_results_pert <- results_files %>%
+  map(clue_parse_result, score_type = "tau", result_type = "pert") %>%
+  reduce(full_join, by = "pert_id", suffix = c("", ".y")) %>%
+  select(-matches("pert_.*\\..*"), -starts_with("pcl_size.")) %>%
+  gather("gene_set", "normalized_score", -starts_with("pert"))
+```
+
+```{r match_conditions}
+library(stringdist)
+pert_res_matching <- query_results_pert %>%
+  left_join(comp_res_clue %>% select(name, method, cell_line, drug, concentration, time, gene_set), by = "gene_set") %>%
+  mutate(
+    drug_similarity = map2_dbl(
+      pert_iname, drug,
+      ~stringdist(str_to_lower(.x), str_to_lower(.y), method = "lv")
+    )
+  )
+
+pert_res_match_filtered <- pert_res_matching %>%
+  filter(drug_similarity < 2) %>%
+  # Select best matching cell line
+  arrange(desc(normalized_score)) %>%
+  group_by(drug) %>%
+  slice(1) %>%
+  ungroup()
+
+library(ggrepel)
+
+cmap_match_plot <- pert_res_match_filtered %>%
+  ggplot(aes(x = 0, y = normalized_score)) +
+    # geom_segment(
+    #   aes(yend = normalized_score),
+    #   xend = 0.2
+    # ) +
+    geom_point(
+      color = "red"
+    ) +
+    geom_text_repel(
+      aes(label = drug),
+      x = 0.05,
+      nudge_x = 1,
+      hjust = 1
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank()
+    ) +
+    coord_cartesian(xlim = c(0, 1)) +
+    labs(y = "CMap connectivity score", title = "Self-connectivity CMap")
+ggsave(
+  file.path("cmap_overlap", "matched_drugs_tau_score_line_plot.pdf"),
+  cmap_match_plot,
+  width = 3, height = 10
+)
+
+# signature_meta <- read_csv(file.path("wrangled", "cmap_signature_meta.csv.gz")) %>%
+#   mutate(pubchem_cid = as.character(pubchem_cid))
+# 
+# gene_meta <- read_csv(file.path("wrangled", "cmap_gene_meta.csv.gz"))
+# 
+# comp_res_pubchem_ids <- comp_res %>%
+#   distinct(drug) %>%
+#   mutate(
+#     pubchem_id = map(get_cid(str_to_lower(drug), from = "name"), as.character)
+#   )
+# 
+# comp_res_pubchem_ids_unnested <- comp_res_pubchem_ids %>%
+#   unnest(pubchem_id) %>%
+#   drop_na()
+
+# # Fuzzy check if cell lines are called by the same name or slight variations
+# cell_line_comp <- stringdist::stringdistmatrix(
+#   cdk_meta_combined$cell_line %>% unique() %>% str_to_lower(),
+#   signature_meta$cell_id %>% unique() %>% str_to_lower(),
+#   useNames = "strings",
+#   method = "osa"
+# ) %>%
+#   as_tibble(rownames = "cdk") %>%
+#   gather("cmap", "distance", -cdk) %>%
+#   filter(distance <= 2)
+
+# shared_conditions <- comp_res %>%
+#   select(name, method, cell_line, drug, concentration, time, condition) %>%
+#   group_by(name, method, drug, cell_line) %>%
+#   arrange(desc(concentration), desc(time), .by_group = TRUE) %>%
+#   slice(1) %>%
+#   ungroup() %>%
+#   mutate(drug = str_to_lower(drug)) %>%
+#   inner_join(comp_res_pubchem_ids_unnested, by = "drug") %>%
+#   inner_join(
+#     signature_meta %>% mutate(cell_id = str_to_lower(cell_id)),
+#     by = c("pubchem_id" = "pubchem_cid")
+#   ) %>%
+#   # Remove controls
+#   filter(!(pert_iname %in% c("DMSO", "dsmo"))) %>%
+#   # Remove matches with concentration too different (<50%)
+#   filter(abs(log10(concentration/pert_dose)) < 0.1760913) %>%
+#   # Remove matches with time too different (<50%)
+#   # All CDK data is 24h
+#   filter(abs(log10(time/pert_time)) < 0.1760913) %>%
+#   distinct()
+
+
+```
