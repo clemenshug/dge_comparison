@@ -18,6 +18,9 @@ datasets <- syn("syn21544261") %>%
 
 fastq_counts <- syn("syn21542323") %>%
   read_csv()
+
+dataset_names <- syn("syn21641420") %>%
+  read_csv()
 ```
 
 
@@ -65,20 +68,6 @@ dataset_stats <- count_stats %>%
 
 
 ```{r plot_count_stats}
-
-dataset_names <- tribble(
-  ~dataset, ~dataset_name, ~batch,
-  "jsm_merck", "2017_09_john_santa_maria_merck_drugs", "2017_09",
-  "lincs_cdk4_6_7", "2017_09_lincs_cdk4_6_inhibitors", "2017_09",
-  "ld_dub", "2018_06_laura_doherty_dub_inhibitors", "2018_06",
-  "lincs_cdk4_6_7", "2019_08_lincs_cdk4_6_7_inhibitors", "2019_08",
-  "sr_repurposing", "2018_02_steven_rodriguez_ad_repurposing", "2018_02",
-  "sr_repurposing", "2018_11_steven_rodriguez_ad_repurposing", "2018_11",
-) %>%
-  mutate(
-    dataset_name = as.factor(dataset_name) %>%
-      fct_inorder()
-  )
 
 count_names <- tribble(
   ~count_type, ~count_type_name,
