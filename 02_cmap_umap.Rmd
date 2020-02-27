@@ -5,6 +5,8 @@ library(tidyverse)
 library(synExtra)
 library(here)
 library(cmapR)
+library(genebabel)
+library(processx)
 
 synapser::synLogin()
 syn <- synExtra::synDownloader("data")
@@ -36,11 +38,8 @@ drug_pertubations <- signature_meta %>%
   drop_na(lspci_id) %>%
   distinct()
 
-drug_pertubations_highest_last <- drug_pertubations %>%
-  filter(cell_id == "MCF7", pert_type == "trt_cp") %>%
-  arrange(desc(pert_dose), desc(pert_time)) %>%
-  group_by(pert_iname, pert_type, cell_id) %>%
-  slice(1) %>%
+drug_pertubations_mcf7 <- drug_pertubations %>%
+  filter(cell_id == "MCF7", pert_type %in% c("trt_cp")) %>%
   ungroup()
 
 
@@ -73,8 +72,7 @@ cmap_mat <- cmap_paths$mat %>%
 cmap_mat_reduced <- cmap_mat[
   ,
   colnames(cmap_mat) %in% (
-    drug_pertubations_highest_last %>%
-      pull(sig_id)
+    drug_pertubations_mcf7[["sig_id"]]
   )
 ]
 
@@ -83,25 +81,80 @@ cmap_mat_reduced <- cmap_mat[
 
 
 ```{r umap}
-
-library(umap)
-
-cmap_umap <- umap(t(cmap_mat_reduced))
-cmap_umap_scaled <- umap(
-  scale(t(cmap_mat_reduced))
+Sys.setenv(
+  PATH = paste(
+    c("/usr/local/anaconda3/bin", Sys.getenv("PATH")), 
+    collapse = .Platform$path.sep
+  ),
+  PYTHONHOME = "/usr/local/anaconda3",
+  PYTHONPATH = "/usr/local/anaconda3/lib/python3.7/site-packages"
 )
+
+run_umap <- function(
+  mat,
+  py_exec = "/usr/local/anaconda3/bin/python",
+  py_home = "/usr/local/anaconda3/",
+  py_path = "/usr/local/anaconda3/lib/python3.7/site-packages"
+) {
+  mat_path <- tempfile(fileext = ".npy")
+  out_path <- tempfile(fileext = ".npy")
+  RcppCNPy::npySave(
+    mat_path,
+    mat
+  )
+  py_program <- paste(
+    "import umap",
+    "import numpy as np",
+    "import sys",
+    paste0("mat = np.load('", mat_path, "')"),
+    "mapper = umap.UMAP()",
+    "trans = mapper.fit_transform(mat)",
+    paste0("np.save('", out_path, "', trans.astype(np.float_))"),
+    sep = "; "
+  )
+  x <- system2(
+    py_exec,
+    c(
+      "-c",
+      paste0("\"", py_program, "\"")
+    ),
+    wait = TRUE
+  )
+  RcppCNPy::npyLoad(
+    out_path
+  )
+}
+
+cmap_umap <- list(
+  unscaled = t(cmap_mat_reduced),
+  scaled = scale(t(cmap_mat_reduced))
+) %>%
+  map(run_umap)
 
 write_rds(
   cmap_umap,
-  file.path(wd, "cmap_umap.rds")
+  file.path(wd, "cmap_umap.rds"),
+  compress = "gz"
 )
+```
 
-cmap_umap_df <- cmap_umap$layout %>%
-  as.data.frame() %>%
-  rownames_to_column("sig_id") %>%
-  left_join(drug_pertubations_highest, by = "sig_id") %>%
-  as_tibble()
 
+```{r vis_umap}
+cmap_umap_df <- cmap_umap %>%
+  map(
+    ~.x %>%
+      magrittr::set_rownames(colnames(cmap_mat_reduced)) %>%
+      as.data.frame() %>%
+      rownames_to_column("sig_id") %>%
+      left_join(drug_pertubations_mcf7, by = "sig_id") %>%
+      as_tibble()
+  ) %>%
+  enframe("scaled") %>%
+  unnest(value)
+
+
+# cmap_umap_df_win <- cmap_umap_df %>%
+#   mutate(V1 = if_else(V1 > 0, 0, V1), V2 = if_else(V2 < 2.5, 2.5, V2))
 
 # umap_tas_plot <- function(umap_df, tas_df)
 
@@ -109,82 +162,103 @@ umap_plot <- cmap_umap_df %>%
   ggplot(aes(V1, V2)) +
     geom_point(alpha = 0.8) +
     theme_bw() +
-    labs(x = "UMAP 1", y = "UMAP 2")
+    labs(x = "UMAP 1", y = "UMAP 2") +
+    facet_wrap(vars(scaled), scales = "free")
 
 ggsave(
   file.path(wd, "umap.png"),
-  umap_plot, width = 6, height = 4
+  umap_plot, width = 10, height = 4
 )
 
-umap_highlight_plot <- cmap_umap_df %>%
-  left_join(
-    tas %>%
-      filter(entrez_gene_id == 1029),
-    by = "lspci_id"
-  ) %>%
-  mutate_at(vars(tas), . %>% magrittr::inset(is.na(.), "unknown") %>% factor(levels = c("1", "2", "3", "10", "unknown"))) %>%
-    # mutate_at(vars(tas), . %>% factor(levels = c("1", "2", "3", "10"))) %>%
-  arrange(desc(tas)) %>%
-  ggplot(aes(V1, V2, color = tas)) +
-    geom_point(alpha = 0.8) +
-    scale_color_manual(
-      values = c(
-        "1" = "#b2182b",
-        "2" = "#ef8a62",
-        "3" = "#fddbc7",
-        "10" = "#d9d9d9",
-        "unknown" = "#eeeeee"
+umap_highlight_plot <- function(symbol, umap_quantile = 0.95) {
+  qsymbol <- symbol
+  entrez_ids <- hgnc %>%
+    filter(.data$symbol == qsymbol) %>%
+    pull(entrez_id) %>%
+    as.integer() %>%
+    unique()
+  umap_quantiles <- cmap_umap_df %>%
+    select(scaled, V1, V2) %>%
+    pivot_longer(-scaled, names_to = "variable") %>%
+    group_by(scaled, variable) %>%
+    summarize(
+      quant = list(
+        quantile(value, probs = c(0.5 * (1 - umap_quantile), 1 - (0.5 * (1 - umap_quantile)))) %>%
+          set_names(c("lower_bound", "upper_bound"))
       )
-    ) +
-    theme_bw() +
-    labs(x = "UMAP 1", y = "UMAP 2", color = "Target affinity\nspectrum", title = "EGFR")
+    ) %>%
+    ungroup() %>%
+    unnest_wider(quant) %>%
+    pivot_wider(scaled, names_from = variable, values_from = c(lower_bound, upper_bound))
+  # browser()
+  cmap_umap_df %>%
+    left_join(umap_quantiles, by = "scaled") %>%
+    mutate(
+      V1 = if_else(V1 < lower_bound_V1, lower_bound_V1, V1) %>%
+        {if_else(. >= upper_bound_V1, upper_bound_V1, .)},
+      V2 = if_else(V2 < lower_bound_V2, lower_bound_V2, V2) %>%
+        {if_else(. >= upper_bound_V2, upper_bound_V2, .)}
+    ) %>%
+    arrange(pert_iname, desc(pert_dose), desc(pert_time)) %>%
+    group_by(pert_iname, scaled) %>%
+    slice(1) %>%
+    ungroup() %>%
+    # mutate(V1 = if_else(V1 > 0, 0, V1), V2 = if_else(V2 > 5, 5, V2)) %>%
+    left_join(
+      tas %>%
+        filter(entrez_gene_id %in% entrez_ids),
+      by = "lspci_id"
+    ) %>%
+    mutate_at(vars(tas), . %>% magrittr::inset(is.na(.), "unknown") %>% factor(levels = c("1", "2", "3", "10", "unknown"))) %>%
+      # mutate_at(vars(tas), . %>% factor(levels = c("1", "2", "3", "10"))) %>%
+    arrange(desc(tas)) %>%
+    ggplot(aes(V1, V2, color = tas)) +
+      geom_point(alpha = 0.8) +
+      scale_color_manual(
+        values = c(
+          "1" = "#b2182b",
+          "2" = "#ef8a62",
+          "3" = "#fddbc7",
+          "10" = "#d9d9d9",
+          "unknown" = "#eeeeee"
+        )
+      ) +
+      theme_bw() +
+      labs(x = "UMAP 1", y = "UMAP 2", color = "Target affinity\nspectrum", title = symbol)
+}
+
+single_target_highlight <- umap_highlight_plot("JAK3") +
+  facet_wrap(vars(scaled), scales = "free")
+
+umap_highlight_plot("ERBB2") +
+  facet_wrap(vars(scaled), scales = "free")
 
 ggsave(
-  file.path(wd, "umap_highlight_egfr.png"),
-  umap_highlight_plot, width = 6, height = 4
+  file.path(wd, "umap_highlight_erbb2.png"),
+  single_target_highlight, width = 6, height = 4
 )
 
 ```
 
 
 ```{r deseq_integration}
-cmp_table <- syn("syn21094266") %>%
-  read_csv()
-
-c <- cmp_table %>%
-  # drop_na(pref_name) %>%
-  filter(!(is.na(pref_name) & is.na(alt_names))) %>%
-  transmute(
-    lspci_id,
-    name = map2(
-      pref_name, alt_names,
-      ~c(
-        .x,
-        if (is.na(.y)) NULL else str_split(.y, fixed("|"))[[1]]
-      )
-    )
-  ) %>%
-  unnest_longer(name) %>%
-  mutate(name_norm = str_replace_all(name, "-|\\(|\\)|\\s", "") %>% str_to_lower()) %>%
-  distinct()
-
-deseq_res_raw <- here("deseq", "deseq_treatment_vs_control_result.rds") %>%
+deseq_res_raw <- syn("syn21559856") %>%
   read_rds()
 
-deseq_res <- deseq_res_raw %>%
-  mutate(
-    drug_norm = str_replace_all(drug, "-|\\(|\\)|\\s", "") %>% str_to_lower()
-  ) %>%
-  left_join(
-    select(cmpd_name_map, name_norm, lspci_id),
-    by = c("drug_norm" = "name_norm")
-  )
+# deseq_res <- deseq_res_raw %>%
+#   mutate(
+#     drug_norm = str_replace_all(drug, "[^a-zA-Z\\d]+", "") %>% str_to_lower()
+#   ) %>%
+#   left_join(
+#     select(cmpd_name_map, name_norm, lspci_id),
+#     by = c("drug_norm" = "name_norm")
+#   )
 
-deseq_res_cmap <- deseq_res %>%
+deseq_res_cmap <- deseq_res_raw %>%
   drop_na(lspci_id) %>%
-  filter(cell_line == "MCF7") %>%
-  group_by(method, drug) %>%
-  arrange(desc(concentration), desc(time)) %>%
+  filter(cells == "MCF7") %>%
+  group_by(drug) %>%
+  arrange(desc(drug_conc), desc(time)) %>%
   slice(1) %>%
   ungroup() %>%
   nest_join(
