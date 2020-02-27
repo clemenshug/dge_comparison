@@ -151,8 +151,12 @@ comp_deseqs_calc <- comp_deseqs %>%
   )
 
 
-write_rds(comp_deseqs_calc, here("deseq", "deseq_treatment_vs_control.rds"))
-# comp_deseqs_calc <- read_rds(here("deseq", "deseq_treatment_vs_control.rds"))
+write_rds(
+  comp_deseqs_calc,
+  here("deseq", "deseq_treatment_vs_control.rds"),
+  compress = "gz"
+)
+comp_deseqs_calc <- read_rds(here("deseq", "deseq_treatment_vs_control.rds"))
 
 unloadNamespace("synapser")
 unloadNamespace("PythonEmbedInR")
@@ -301,6 +305,8 @@ comp_deseqs_conc <- comps_inputs_conc %>%
     )
   )
 
+unloadNamespace("synapser")
+unloadNamespace("PythonEmbedInR")
 comp_deseqs_conc_calc <- comp_deseqs_conc %>%
   # dplyr::rename(meta = deseq_meta) %>%
   mutate(
@@ -311,11 +317,13 @@ comp_deseqs_conc_calc <- comp_deseqs_conc %>%
   )
 
 
-write_rds(comp_deseqs_conc_calc, here("deseq", "deseq_treatment_vs_control_conc.rds"))
+write_rds(
+  comp_deseqs_conc_calc, here("deseq", "deseq_treatment_vs_control_conc.rds"),
+  compress = "gz"
+)
 # comp_deseqs_conc_calc <- read_rds(here("deseq", "deseq_treatment_vs_control_conc.rds"))
 
-unloadNamespace("synapser")
-unloadNamespace("PythonEmbedInR")
+
 
 # plan(multisession(workers = 4))
 # options(future.globals.maxSize = 1500 * 1024**2)
