@@ -7,6 +7,11 @@ output: html_document
 
 ```{r setup, include=FALSE}
 library(tidyverse)
+library(here)
+library(synExtra)
+synapser::synLogin()
+syn <- synExtra::synDownloader("data")
+
 ```
 
 ## Locate raw CDK4/6 files on o2
@@ -64,40 +69,70 @@ fastqs <- fastqs_list %>%
 
 metadata <- list(
   "201608" = metadata_list[["201608"]] %>%
-    rename(well = Well, cell_line = `cell line`, concentration = dose,
-           library_prep_date = `Library prep`, rna_concentration = `RNA ng/ul`) %>%
-    mutate(sample_id = well) %>%
+    transmute(
+      sample_id = paste("201608", Well, sep = "_"),
+      well = Well,
+      cells = `cell line`,
+      drug,
+      drug_conc = dose,
+      time = time %>%
+        str_replace(fixed("h"), "") %>%
+        as.integer()
+    ) %>%
     drop_na(sample_id),
   "201701" = metadata_list[["201701"]] %>%
-    rename(well = Position, sample_id = Sample, time = `Time point`, harvest = Harvest,
-           library_prep_date = `Library prep date`, rna_concentration = `RNA (ng/ul)`) %>%
-    # Remove samples unrelated to CDK4/6 experiment
-    filter(sample_id < 25) %>%
-    separate(Treatment, c("concentration", "drug"), sep = " ", fill = "left", extra = "merge") %>%
-    mutate(
-      time = str_replace(time, " hours", "h"),
-      concentration = as.numeric(replace_na(concentration, 0)),
+    transmute(
+      sample_id = paste("201701", Sample, sep = "_"),
+      well = Position,
       # According to Kartik all samples in this experiment (201701) are MCF7
-      cell_line = "MCF7"
+      cells = "MCF7",
+      Treatment,
+      time = `Time point` %>%
+        str_replace(fixed(" hours"), "") %>%
+        as.integer()
     ) %>%
-    mutate_at(vars(well, sample_id), as.character)
+    separate(Treatment, c("drug_conc", "drug"), sep = " ", fill = "left", extra = "merge") %>%
+    mutate(drug_conc = as.numeric(replace_na(drug_conc, 0)))
 ) %>%
   bind_rows(.id = "run") %>%
   mutate(
     drug = recode(
       drug, Palbo = "palbociclib", Abema = "abemaciclib", Ribo = "ribociclib",
-      ctrl = "dmso"
+      ctrl = "control", dmso = "control"
     )
-  )
+  ) %>%
+  mutate(
+    condition = do.call(
+      paste,
+      as.list(.)[c("cells", "stim", "stim_conc", "drug", "drug_conc", "time")] %>%
+        magrittr::inset2("sep", "_")
+    ),
+    control_condition = do.call(
+      paste,
+      as.list(.)[c("cells", "stim", "stim_conc", "drug", "drug_conc", "time")] %>%
+        magrittr::inset2("drug", "control") %>%
+        magrittr::inset2("drug_conc", 0) %>%
+        magrittr::inset2("sep", "_")
+    ) %>%
+      magrittr::inset(!(. %in% condition), NA_character_)
+  ) %>%
+  # Get rid of irrelevant samples
+  drop_na(time)
+
+write_csv(
+  metadata, here("wrangled", "meta_cdk4_6_bulk.csv")
+)
 
 metadata_fastq <- fastqs %>%
   mutate(
-    sample_id = str_match(basename(fastq), "^[^_]+_([^_]+)_.+")[,2]
+    sample_id = paste(run, str_match(basename(fastq), "^[^_]+_([^_]+)_.+")[,2], sep = "_")
   ) %>%
-  left_join(metadata, by = c("run", "sample_id")) %>%
-  # Remove samples unrelated to CDK4/6 experiment
-  drop_na(drug)
-write_csv(metadata_fastq, file.path("..", "wrangled", "cdk_fastq.csv"))
+  inner_join(metadata, by = c("run", "sample_id"))
+
+write_csv(
+  metadata_fastq, here("wrangled", "cdk_bulk_fastq.csv")
+)
+
 ```
 
 ## ERCC spike-in
@@ -128,14 +163,32 @@ at https://github.com/clemenshug/o2jobber )
 
 ```{r metadata_alignment}
 metadata_alignment <- metadata_fastq %>%
-  mutate(
-    id = paste(run, sample_id, drug, concentration, sep = "_"),
+  transmute(
+    id = sample_id,
     fastq = paste0("transfer.rc.hms.harvard.edu:", fastq),
-    transcriptome_fasta = "/home/ch305/annotation/hsap/GRCh38.95/Homo_sapiens.GRCh38.combined.fa",
-    transcriptome_gtf = "/home/ch305/annotation/hsap/GRCh38.95/Homo_sapiens.GRCh38.95.gtf",
+    transcriptome_fasta = "/home/ch305/annotation/hsap/GRCh38.98/Homo_sapiens.GRCh38.combined.fa",
+    transcriptome_gtf = "/home/ch305/annotation/hsap/GRCh38.98/Homo_sapiens.GRCh38.98.gtf",
     spikein_fasta = "/home/ch305/annotation/ercc/ERCC92.fa"
   )
-write_csv(metadata_alignment, file.path("..", "wrangled", "cdk_bulk_alignment_metadata.csv"))
+write_csv(
+  metadata_alignment,
+  here("wrangled", "cdk_bulk_alignment_metadata.csv")
+)
 ```
 
 Followed by using o2jobber to start alignment job with bcbio on O2.
+
+```{r synapse}
+activity <- synapser::Activity(
+  name = "Wrangle bulk CDK4/6 inhibitor data",
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/wrangling/01_cdk_raw_files.Rmd"
+)
+
+c(
+  here("wrangled", "meta_cdk4_6_bulk.csv")
+) %>%
+  synStoreMany(parentId = "syn21541011", activity = activity)
+
+#rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens/
+```
+

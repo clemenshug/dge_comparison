@@ -1,0 +1,101 @@
+---
+title: "bulk files"
+author: "Clemens Hug"
+date: "2/23/2019"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(here)
+library(synapser)
+library(synExtra)
+
+synLogin()
+syn <- synDownloader("data")
+```
+
+
+```{r loading}
+cdk_meta <- syn("syn21644142") %>%
+  read_csv()
+
+count_syn <- synGetChildren("syn21643764") %>%
+  as.list() %>%
+  map(as_tibble) %>%
+  bind_rows() %>%
+  select(syn_id = id, syn_name = name) %>%
+  filter(str_detect(syn_name, "\\.counts$")) %>%
+  mutate(
+    sample_id = str_sub(syn_name, start = 2L) %>%
+      str_replace(fixed(".counts"), "")
+  )
+```
+
+
+```{r wrangle_counts}
+counts_raw <- count_syn %>%
+  mutate(
+    counts = map(
+      syn_id,
+      syn
+    ) %>%
+      map(read_tsv, col_names = c("ensembl_gene_id", "count"))
+  )
+
+all_ensembl_ids <- counts_raw %>%
+  pull(counts) %>%
+  map("ensembl_gene_id") %>%
+  reduce(union)
+
+mart <- biomaRt::useMart(
+  host = "http://sep2019.archive.ensembl.org",
+  biomart = "ENSEMBL_MART_ENSEMBL",
+  dataset = "hsapiens_gene_ensembl"
+)
+ensembl_gene_id_mapping_biomart <- biomaRt::select(
+  mart, all_ensembl_ids,
+  c("hgnc_symbol", "ensembl_gene_id", "gene_biotype"), "ensembl_gene_id"
+) %>%
+  as_tibble() %>%
+  filter(gene_biotype == "protein_coding") %>%
+  mutate(hgnc_symbol = magrittr::inset(hgnc_symbol, hgnc_symbol == "", NA_character_)) %>%
+  rename(symbol = hgnc_symbol) %>%
+  select(-gene_biotype) %>%
+  # keep only a single symbol per ensembl_gene_id
+  group_by(ensembl_gene_id) %>%
+  slice(1) %>%
+  ungroup()
+
+counts_long <- counts_raw %>%
+  select(sample_id, counts) %>%
+  unnest(counts) %>%
+  inner_join(ensembl_gene_id_mapping_biomart, by = "ensembl_gene_id")
+
+counts <- tribble(
+  ~dataset, ~plate, ~batch, ~counts, ~meta,
+  "2016_08_cdk4_6_inhibitors_bulk", 1, "2016_08", counts_long, cdk_meta
+)
+
+write_rds(
+  counts,
+  here("wrangled", "counts_bulk_raw.rds"),
+  compress = "gz"
+)
+
+```
+
+
+```{r synapse}
+activity <- synapser::Activity(
+  name = "Wrangle bulk count data",
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/wrangling/10_bulk_datasets.Rmd"
+)
+
+c(
+  here("wrangled", "counts_bulk_raw.rds")
+) %>%
+  synStoreMany(parentId = "syn21542764", activity = activity)
+```
+
