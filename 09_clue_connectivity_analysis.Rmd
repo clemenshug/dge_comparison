@@ -1,0 +1,200 @@
+---
+title: "Clue connectivity analysis"
+author: "Clemens Hug"
+date: "2/6/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(synExtra)
+library(tidyverse)
+library(cmapR)
+library(here)
+library(egg)
+library(broom)
+library(ggrepel)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("data")
+
+wd <- here("clue_query")
+dir.create(wd, showWarnings = FALSE)
+
+theme_set(theme_bw())
+```
+
+
+```{r load}
+clue_res <- syn("syn21646960") %>%
+  read_rds()
+
+pertubation_meta <- syn("syn21547097") %>%
+  read_csv()
+
+comp_res <- syn("syn21559859") %>%
+  read_rds()
+
+compound_dict <- syn("syn21094266") %>%
+  read_csv()
+
+```
+
+```{r match_conditions}
+comp_res_clue <- comp_res %>%
+  mutate(
+    gene_set = paste(dataset, drug, cells, drug, stim, stim_conc, time, sep = "_") %>%
+      str_replace_all("\\s", "_") %>%
+      str_replace_all("[^\\w]", "")
+  )
+
+clue_res_pert <- clue_res %>%
+  filter(result_type == "pert") %>%
+  mutate(
+    data = map(
+      data,
+      ~.x %>%
+        {if("cell_id" %in% colnames(.)) mutate_at(., vars(cell_id), str_to_lower) else .} %>%
+        inner_join(
+          pertubation_meta %>%
+            distinct(pert_id, lspci_id_target = lspci_id),
+          by = "pert_id"
+        ) %>%
+        inner_join(
+          comp_res_clue %>%
+            distinct(gene_set, cell_id_query = str_to_lower(cells), lspci_id_query = lspci_id),
+          by = "gene_set"
+        )
+    )
+  )
+
+cell_matching <- str_to_lower(unique(comp_res$cells)) %in% str_to_lower(unique(clue_res_pert$data[[1]]$cell_id))
+
+self_conn_plot <- function(df) {
+  df %>%
+  ggplot(aes(x = 0, y = tau)) +
+  # geom_segment(
+  #   aes(yend = normalized_score),
+  #   xend = 0.2
+  # ) +
+  geom_point(
+    color = "red"
+  ) +
+  geom_text_repel(
+    aes(label = pert_iname),
+    x = 0.05,
+    nudge_x = 1,
+    hjust = 1
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank()
+  ) +
+  coord_cartesian(xlim = c(0, 1)) +
+  labs(y = "CMap connectivity score", title = "Self-connectivity CMap")
+}
+
+cmap_match_all_summary <- clue_res_pert %>%
+  filter(score_level == "summary") %>%
+  chuck("data", 1) %>%
+  filter(lspci_id_target == lspci_id_query) %>%
+  arrange(desc(tau)) %>%
+  group_by(lspci_id_query) %>%
+  slice(1) %>%
+  ungroup() %>%
+  self_conn_plot()
+
+ggsave(
+  file.path(wd, "cmap_match_all_summary.pdf"),
+  cmap_match_all_summary,
+  width = 3, height = 10
+)
+
+cmap_match_cell_cell <- clue_res_pert %>%
+  filter(score_level == "cell") %>%
+  chuck("data", 1) %>%
+  filter(lspci_id_target == lspci_id_query, cell_id == cell_id_query) %>%
+  arrange(desc(tau)) %>%
+  group_by(lspci_id_query) %>%
+  slice(1) %>%
+  ungroup() %>%
+  self_conn_plot()
+
+ggsave(
+  file.path(wd, "cmap_match_cell_cell.pdf"),
+  cmap_match_cell_cell,
+  width = 3, height = 10
+)
+
+cmap_match_cell_best_matching <- clue_res_pert %>%
+  filter(score_level == "cell") %>%
+  chuck("data", 1) %>%
+  filter(lspci_id_target == lspci_id_query) %>%
+  arrange(desc(tau)) %>%
+  group_by(lspci_id_query) %>%
+  slice(1) %>%
+  ungroup() %>%
+  self_conn_plot()
+
+ggsave(
+  file.path(wd, "cmap_match_cell_best_matching.pdf"),
+  cmap_match_cell_best_matching,
+  width = 3, height = 10
+)
+
+cmap_match_cell_worst_matching <- clue_res_pert %>%
+  filter(score_level == "cell") %>%
+  chuck("data", 1) %>%
+  filter(lspci_id_target == lspci_id_query) %>%
+  arrange(tau) %>%
+  group_by(lspci_id_query) %>%
+  slice() %>%
+  ungroup() %>%
+  self_conn_plot()
+
+ggsave(
+  file.path(wd, "cmap_match_cell_worst_matching.pdf"),
+  cmap_match_cell_worst_matching,
+  width = 3, height = 10
+)
+
+clue_match_best_vs_worst <- clue_res_pert %>%
+  filter(score_level == "cell") %>%
+  chuck("data", 1) %>%
+  filter(lspci_id_target == lspci_id_query) %>%
+  arrange(desc(tau)) %>%
+  group_by(lspci_id_query) %>%
+  # Make sure that drugs have been profiled in adequate number of cell lines
+  slice(c(1, n())) %>%
+  mutate(match = c("best", "worst")) %>%
+  ungroup() %>%
+  ggplot(aes(match, tau, group = lspci_id_query)) +
+    geom_line() +
+    labs(x = "CMap cell line match", y = "Connectivity score")
+  
+ggsave(
+  file.path(wd, "clue_match_best_vs_worst.pdf"),
+  clue_match_best_vs_worst,
+  width = 5, height = 10
+)
+
+
+```
+
+
+
+```{r drugs_not_cmap}
+drugs_dge <- comp_res %>%
+  pull(lspci_id) %>%
+  unique()
+
+pertubation_meta
+
+drugs_dge_not_cmap <- compound_dict %>%
+  filter(lspci_id %in% drugs_dge[!drugs_dge %in% pertubation_meta$lspci_id])
+
+
+```

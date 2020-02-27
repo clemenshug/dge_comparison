@@ -1,0 +1,166 @@
+---
+title: "Query Clue CMap drug sets"
+author: "Clemens Hug"
+date: "7/2/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(genebabel)
+library(clueR)
+library(synExtra)
+library(here)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("data")
+
+wd <- here("clue_query")
+dir.create(wd, showWarnings = FALSE)
+```
+
+## Goal
+
+Query 
+
+
+
+```{r loading}
+# comp_res_raw <- syn("syn21559856") %>%
+#   read_rds()
+
+comp_res_conc_raw <- syn("syn21559859") %>%
+  read_rds()
+
+signature_meta <- syn("syn21547101") %>%
+  read_csv()
+
+pertubation_meta <- syn("syn21547097") %>%
+  read_csv()
+
+cmap_gene_meta <- syn("syn21547102") %>%
+  read_csv()
+
+```
+
+Only querying using highest concentration and latest time.
+
+```{r querying_cmap}
+comp_res_selected <- comp_res_conc_raw
+  # arrange(desc(time)) %>%
+  # group_by(dataset, drug, cells, time) %>%
+  # slice(1) %>%
+  # ungroup()
+
+library(genebabel)
+
+comp_res_entrez <- comp_res_selected %>%
+  mutate(
+    result = map(
+      result,
+      function(df) {
+        df %>%
+          {suppressWarnings(join_hgnc(., "ensembl_gene_id", "ensembl_gene_id", "entrez_id"))} %>%
+          # select(-symbol) %>%
+          dplyr::rename(gene_id = entrez_id)
+      }
+    )
+  )
+
+MAX_PER_QUERY = 25
+comp_res_clue <- comp_res_entrez %>%
+  filter(
+    map_lgl(result, ~nrow(filter(.x, padj < 0.05)) > 20)
+  )  %>%
+  mutate(
+    gene_set = paste(dataset, drug, cells, drug, stim, stim_conc, time, sep = "_") %>%
+      str_replace_all("\\s", "_") %>%
+      str_replace_all("[^\\w]", ""),
+    result = map(
+      result,
+      ~.x %>%
+        drop_na(padj) %>%
+        arrange(padj) %>%
+        filter(padj < 0.05) %>%
+        mutate(direction = if_else(log2FoldChange < 0, "down", "up"))
+    )
+  ) %>%
+  split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
+  map(
+    ~bind_rows(set_names(.x[["result"]], .x[["gene_set"]]), .id = "gene_set") %>%
+      select(gene_set, gene_id, direction)
+  ) %>%
+  map(
+    clue_gmt_from_df,
+    drop_invalid = TRUE
+  )
+
+comp_res_jobs <- comp_res_clue %>%
+  imap(
+    ~clue_query_submit(
+      .x[["up"]], .x[["down"]],
+      name = paste0("dge_job_", .y),
+      use_fast_tool = FALSE
+    )
+  )
+
+
+walk(
+  comp_res_jobs,
+  clue_query_wait
+)
+
+
+```
+Download from Clue after submission, download within R was buggy
+
+Put into synapse at syn21644366
+
+
+```{r}
+clue_res_raw <- synChildren("syn21644366") %>%
+  map(syn)
+
+clue_res <- crossing(
+  score_type = "tau",
+  result_type = c("pert", "pcl"),
+  score_level = c("cell", "summary")
+) %>%
+  mutate(
+    data = pmap(
+      .,
+      function(...) {
+        clue_res_raw %>%
+          map(clue_parse_result, ...) %>%
+          bind_rows()
+      }
+    )
+  )
+
+write_rds(
+  clue_res,
+  file.path(wd, "clue_results_conc.rds"),
+  compress = "gz"
+)
+
+```
+
+```{r synapse}
+activity <- synapser::Activity(
+  name = "Query clue",
+  used = c(
+    "syn21559859",
+    "syn21547101",
+    "syn21547097",
+    "syn21547102"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/07_query_clue.Rmd"
+)
+
+c(
+  file.path(wd, "clue_results_conc.rds")
+) %>%
+  synStoreMany(parentId = "syn21547022", activity = activity)
+
+```
+
