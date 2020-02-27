@@ -6,15 +6,18 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
+library(synExtra)
 library(tidyverse)
 library(cmapR)
-library(patchwork)
+library(here)
 library(egg)
 library(broom)
 
-paste_ <- function(...) {
-  paste(..., sep = "_")
-}
+synapser::synLogin()
+syn <- synExtra::synDownloader("data")
+
+wd <- here("cmap_overlap")
+dir.create(wd, showWarnings = FALSE)
 
 theme_set(theme_bw())
 ```
@@ -44,27 +47,50 @@ The goal of this analysis is to
 
 ```{r loading}
 
-comp_res <- readr::read_rds(file.path("deseq", "deseq_treatment_vs_control_result.rds"))
+comp_res <- syn("syn21559859") %>%
+  read_rds()
 
-l1000 <- readr::read_csv(file.path("wrangled", "l1000_gene_list.csv"))
+comp_res_all <- syn("syn21559856") %>%
+  read_rds()
 
-drug_ids <- read_csv(file.path("wrangled", "lincs_drug_ids.csv"))
+gene_meta <- syn("syn21547102") %>%
+  read_csv()
+
+signature_meta <- syn("syn21547101") %>%
+  read_csv()
+
+counts_raw <- syn("syn21544261") %>%
+  read_rds()
+
+dataset_names <- syn("syn21641420") %>%
+  read_csv()
 ```
 
-```{r read_data}
-data_sets <- tibble(name = c("cdk", "ad"))
-
-data_sets <- data_sets %>%
-  mutate(
-    meta = map(name, ~read_csv(file.path("wrangled", .x, "meta.csv"))),
-    counts = map(name, ~read_csv(file.path("wrangled", .x, "counts.csv.gz")))
+```{r counts_wrangling}
+counts <- counts_raw %>%
+  pull(counts) %>%
+  bind_rows() %>%
+  select(
+    ensembl_gene_id, symbol, sample_id, count
   )
-```
-```{r count_table}
-counts <- data_sets %>%
-  unnest(counts) %>%
-  dplyr::select(name, symbol, sample_id, count) %>%
-  left_join(data_sets$meta %>% bind_rows() %>% dplyr::select(sample_id, method), by = "sample_id")
+
+meta <- counts_raw %>%
+  select(dataset, batch, meta) %>%
+  unnest(meta) %>%
+  left_join(dataset_names, by = c("dataset", "batch"))
+
+# Using only raw counts for this analysis
+l1000_counts <- counts %>%
+  mutate(
+    l1000 = ifelse(
+      symbol %in% (gene_meta %>% filter(pr_is_lm == 1) %>% pull(symbol)),
+      "l1000", "not_l1000"
+    )
+  ) %>%
+  inner_join(
+    meta,
+    by = "sample_id"
+  )
 
 ```
 
@@ -76,61 +102,92 @@ First, using naive threshold to define "detectable" genes. Requiring at least
 5 counts seems adequate.
 
 
-```{r distribution_l1000_counts}
-# Using only raw counts for this analysis
-l1000_counts <- counts %>%
-  mutate(l1000 = ifelse(symbol %in% l1000$gene_symbol, "l1000", "not_l1000"))
-
-l1000_line_data <- l1000_counts %>%
-  group_by(name, method) %>%
-  group_modify(
-    function (df, group) {
-      df %>%
-        mutate(symbol = fct_reorder(symbol, count, .fun = median)) %>%
-        group_by(symbol, l1000) %>%
-        summarize(quant = list(quantile(count, probs = c(0, .25, .5, .75, 1)))) %>%
-        mutate(quant = map(quant, enframe, name = "quantile", value = "count")) %>%
-        unnest(quant)
-    }
-  ) %>%
-  ungroup()
-
-l1000_line_plot <- l1000_line_data %>%
-  group_nest(name, method) %>%
-  mutate(
-    plot = map(
-      data,
-      ~list(ggplot(.x, aes(as.integer(symbol), count + .1)) +
-        geom_line(aes(color = quantile, group = quantile)) +
-        facet_wrap(~l1000) +
-        scale_y_log10() +
-        ggtitle(paste(.y)))
-    )
-  )
-ggsave(file.path("cmap_overlap", "l1000_count_distribution.pdf"), l1000_line_plot)
-```
-
-
-
 ```{r detectable_l1000}
 
 detectable_threshold <- 5
 fraction_detectable <- l1000_counts %>%
   mutate(detectable = count >= detectable_threshold) %>%
-  group_by(name, method, sample_id, l1000) %>%
-  summarize(n_detectable = sum(detectable), fraction_detectable = n_detectable/n()) %>%
+  group_by(dataset_name, sample_id, l1000) %>%
+  summarize(
+    n_detectable = sum(detectable),
+    fraction_detectable = n_detectable/n(),
+    total_counts = sum(count)
+  ) %>%
   ungroup()
 
 fraction_detectable_plot <- fraction_detectable %>%
-  ggplot(aes(name, fraction_detectable, fill = l1000)) +
+  ggplot(aes(dataset_name, fraction_detectable, fill = l1000)) +
     geom_violin(draw_quantiles = c(.25, .5, .75)) +
-    facet_grid(vars(method)) +
+    # facet_grid(vars(method)) +
     labs(
       x = "Dataset",
-      y = "Fraction of samples where count ≥5",
-      title = "Distribution of detectable genes"
+      y = "Fraction of genes with count ≥5",
+      title = "Detectable genes per sample",
+      fill = "Gene type"
+    ) +
+    coord_flip()
+ggsave(file.path("cmap_overlap", "fraction_detectable.pdf"), fraction_detectable_plot, width = 8, height = 5)
+
+total_counts <- counts %>%
+  group_by(sample_id) %>%
+  summarize(total = sum(count))
+
+detectable_vs_total_counts <- fraction_detectable %>%
+  inner_join(total_counts, by = "sample_id")
+
+detectable_vs_total_counts_plot <- detectable_vs_total_counts %>%
+  ggplot(aes(total, fraction_detectable)) +
+    geom_point(aes(color = l1000), alpha = 0.5, shape = 16) +
+    facet_wrap(vars(dataset_name)) +
+    # facet_grid(vars(name), vars(method), scales = "free_x") +
+    scale_x_log10() +
+    labs(
+      title = "Sequencing depth vs fraction of detectable genes",
+      x = "Total count per library",
+      y = "Fraction of detectable genes",
+      color = "Gene type"
     )
-ggsave(file.path("cmap_overlap", "fraction_detectable.pdf"), fraction_detectable_plot, width = 5, height = 5)
+ggsave(file.path("cmap_overlap", "sequencing_depth_vs_fraction_detectable.pdf"), detectable_vs_total_counts_plot, width = 9, height = 6)
+
+fraction_detected_per_gene <- l1000_counts %>%
+  mutate(detectable = count >= detectable_threshold) %>%
+  group_by(dataset_name, ensembl_gene_id, symbol, l1000) %>%
+  summarize(n_detectable = sum(detectable), fraction_detectable = n_detectable/n()) %>%
+  ungroup()
+
+per_gene_scatter_plot <- function(experiment_1, experiment_2, data, ...) {
+  e1 <- sym(experiment_1)
+  e2 <- sym(experiment_2)
+  # browser()
+  ggplot(data, aes(!!e1, !!e2)) +
+    geom_point(aes(color = l1000)) +
+    labs(title = paste0("Fraction of samples where gene count > 5\n", experiment_1, " vs\n", experiment_2))
+}
+
+per_gene_comparison_plots <- combn(unique(fraction_detected_per_gene[["dataset_name"]]), 2) %>%
+  t() %>%
+  magrittr::set_colnames(c("experiment_1", "experiment_2")) %>%
+  as_tibble() %>%
+  mutate(
+    data = map2(
+      experiment_1, experiment_2,
+      ~fraction_detected_per_gene %>%
+        # Remove bulk, pointless comparison because only cdk dataset has it
+        dplyr::filter(dataset_name %in% c(.x, .y)) %>%
+        dplyr::select(dataset_name, ensembl_gene_id, l1000, fraction_detectable) %>%
+        spread(dataset_name, fraction_detectable, fill = 0)
+    )
+  ) %>%
+  mutate(
+    plot = pmap(
+      .,
+      per_gene_scatter_plot
+    )
+  )
+
+per_gene_comparison_plots_combined <- per_gene_comparison_plots$plot %>%
+  patchwork::wrap_plots(byrow = TRUE, ncol = 1)
+ggsave(file.path("cmap_overlap", "fraction_detectable_per_gene_pairwise_comparison.pdf"), per_gene_comparison_plots_combined, width = 5, height = 40)
 ```
 
 Also plotting how often each gene is detectable across samples.
@@ -234,84 +291,89 @@ ggsave(file.path("cmap_overlap", "fraction_detectable_per_gene_density_scatter.p
 ```
 
 
+```{r diff_expr_l1000}
+all_ensembl_ids <- comp_res %>%
+  pull(result) %>%
+  map("ensembl_gene_id") %>%
+  reduce(union)
+
+mart <- biomaRt::useMart(
+  host = "http://sep2019.archive.ensembl.org",
+  biomart = "ENSEMBL_MART_ENSEMBL",
+  dataset = "hsapiens_gene_ensembl"
+)
+ensembl_gene_id_mapping_biomart <- biomaRt::select(
+  mart, all_ensembl_ids,
+  c("hgnc_symbol", "ensembl_gene_id", "gene_biotype"), "ensembl_gene_id"
+) %>%
+  as_tibble() %>%
+  filter(gene_biotype == "protein_coding") %>%
+  mutate(hgnc_symbol = magrittr::inset(hgnc_symbol, hgnc_symbol == "", NA_character_)) %>%
+  rename(symbol = hgnc_symbol) %>%
+  select(-gene_biotype) %>%
+  # keep only a single symbol per ensembl_gene_id
+  group_by(ensembl_gene_id) %>%
+  slice(1) %>%
+  ungroup()
 
 
-## Genes tractable for differential expression by DESeq2
-
-Another idea to quantify the proportion of L1000 genes that are detectable by
-DGE is to perform pairwise comparisons of drug treatment and DMSO using DESeq2.
-and quantifying how many genes are passing the DESeq2 filtering steps. Hope that
-this is more practically relevant than arbitrary thresholds above.
-
-DESeq2 does independent filtering based on the Bioconductor genefilter package 
-to increase power of differential expression analysis. The default filter
-takes into account the average expression of each gene across all replicates and
-conditions. Genes that pass filter are "tractable" by DESeq2 for differential
-expression.
-
-```{r fraction_tractable_deseq}
-deseq_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_control.rds")) %>%
-  mutate(comp_id = 1:n())
-
-fraction_tractable <- deseq_treatment_vs_control %>%
-  mutate(res_df = map(deseq_res, as.tibble, rownames = "gene_id")) %>%
-  select(method, cell_line, drug, concentration, time, res_df) %>%
-  unnest(res_df) %>%
+l1000_diff_stats <- comp_res_all %>%
   mutate(
-    tractable = !is.na(padj),
-    is_l1000 = ifelse(gene_id %in% l1000_ensembl_gene_ids, "l1000", "not_l1000")
+    l1000_stats = map(
+      result,
+      function(r) {
+        df <- r %>%
+          inner_join(
+            ensembl_gene_id_mapping_biomart,
+            by = "ensembl_gene_id"
+          ) %>%
+          inner_join(
+            gene_meta %>%
+              select(symbol, pr_is_lm),
+            by = "symbol"
+          )
+        df %>%
+          mutate(
+            de = if_else(padj < 0.05, "de", "nde") %>%
+              replace_na("nt") %>%
+              factor(levels = c("de", "nde", "nt")),
+            lm = if_else(pr_is_lm == 1, "lm", "nlm") %>%
+              factor(levels = c("lm", "nlm"))
+          ) %>%
+          {table(.[["de"]], .[["lm"]])}
+        
+        # %>%
+        #   group_by(de, lm) %>%
+        #   summarize(
+        #     count = n()
+        #   ) %>%
+        #   ungroup()
+      }
+    )
   )
 
-fraction_tractable_per_gene <- fraction_tractable %>%
-  group_by(method, is_l1000, gene_id) %>%
-  summarize(fraction_tractable = sum(tractable)/n()) %>%
-  ungroup()
+l1000_diff_stats_long <- l1000_diff_stats %>%
+  select(-counts_deseq, -deseq, -result) %>%
+  mutate(
+    frac_lm = map_dbl(l1000_stats, ~.x["de", "lm"] / .x["nde", "lm"]),
+    frac_nlm = map_dbl(l1000_stats, ~.x["de", "nlm"] / .x["nde", "nlm"])
+  )
 
-fraction_tractable_per_condition <- fraction_tractable %>%
-  group_by(method, cell_line, drug, concentration, time) %>%
-  summarize(fraction_tractable = sum(tractable)/n()) %>%
-  ungroup()
+ggplot(l1000_diff_stats_long, aes(frac_lm, frac_nlm)) +
+  geom_point() +
+  coord_equal()
 
-fraction_tractable_per_gene_density_scatter <- fraction_tractable_per_gene %>%
-  spread(method, fraction_tractable) %>%
-  split(.$is_l1000) %>%
-  imap(
-    function(df, gene_set) {
-      p <- density_2d_plot(
-        df,
-        aes(bulk, dge, color = density),
-        histogram_args = list(
-          breaks = seq(from = -.00001, to =1, length.out = 10),
-          closed = "right"
-        ),
-        scatter_elements = list(
-          coord_fixed(),
-          lims(x = c(0, 1), y = c(0, 1)),
-          labs(
-            x = "RNA-seq (fraction of conditions)",
-            y = "DGE (fraction of conditions)",
-            color = "Density of\ngenes",
-            title = gene_set
-          ),
-          scale_color_viridis_c()
-        ),
-        margin_elements = list(
-          lims(x = c(0, 1)),
-          labs(
-            x = NULL,
-            y = "Fraction\ngenes"
-          )
-        )
-      )
-      p
-    }
+n_diff_exp_scatter <- l1000_diff_stats %>%
+  mutate(
+    n_lm = map_dbl(l1000_stats, ~.x["de", "lm"]),
+    n_nlm = map_dbl(l1000_stats, ~.x["de", "nlm"]),
   ) %>%
-  wrap_plots(ncol = 1)
+  ggplot(aes(n_lm, n_nlm)) +
+  geom_point() +
+  labs(x = "N differentially expressed L1000", y = "N differentially expressed non-L1000")
+ggsave(file.path(wd, "n_diff_exp_scatter.pdf"), n_diff_exp_scatter, width = 4, height = 4)
+
 ```
-
-Unfortunately, there are simply too few bulk RNA-seq conditions, can't quantify
-the proportion of conditions where gene is detectable in bulk RNA-seq.
-
 
 
 CMap data has been dowloaded from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE92742
@@ -522,119 +584,5 @@ deseq_cmap_fisher_table <- deseq_cmap_fisher %>%
 ggsave(file.path("cmap_overlap", "cmap_overlap_fisher.pdf"), deseq_cmap_fisher_table, width = 7, height = 10)
 ```
 
-
-Export DGE signatures as GMT files for analysis in CMAP
-
-```{r morpheus_cmap}
-gct_de_data <- deseq_treatment_vs_control %>%
-  select(method, cell_line, drug, concentration, time, deseq, deseq_res) %>%
-  mutate(
-    sample_id = paste_(method, cell_line, drug, concentration, time),
-    deseq_res = map2(
-      deseq, deseq_res,
-      ~.y %>%
-        as.data.frame() %>%
-        rownames_to_column("gene_id")
-    )
-  ) %>%
-  unnest(deseq_res)
-
-gene_ids_all_exp <- gct_de_data %>%
-  group_by(sample_id) %>%
-  summarize(gene_id_set = list(gene_id)) %>%
-  pull(gene_id_set) %>%
-  reduce(base::intersect) %>%
-  sort()
-
-gct_de_rdesc <- gene_meta %>%
-  drop_na(symbol) %>%
-  inner_join(ensembl_gene_id_mapping, by = "symbol") %>%
-  filter(ensembl_gene_id %in% gene_ids_all_exp) %>%
-  # Filter duplicate symbol/ensembl_id mappings, just 2
-  group_by(ensembl_gene_id) %>%
-  slice(1) %>%
-  ungroup() %>%
-  rename(id = ensembl_gene_id) %>%
-  arrange(id) 
-
-gct_de_cdesc <- deseq_treatment_vs_control %>%
-  select(method, cell_line, drug, concentration, time) %>%
-  mutate(id = paste_(method, cell_line, drug, concentration, time)) %>%
-  arrange(id)
-
-gct_de_data_mat <- gct_de_data %>%
-  select(sample_id, gene_id, log2FoldChange) %>%
-  filter(gene_id %in% gct_de_rdesc$id) %>%
-  arrange(gene_id, sample_id) %>%
-  spread(sample_id, log2FoldChange) %>%
-  column_to_rownames("gene_id") %>%
-  as.matrix()
-
-gct_de_gct <- new(
-  getClassDef("GCT", package = "cmapR"),
-  mat = gct_de_data_mat, rid = gct_de_rdesc$id, cid = gct_de_cdesc$id,
-  cdesc = as.data.frame(gct_de_cdesc), rdesc = as.data.frame(gct_de_rdesc)
-)
-
-cmapR::write.gct(
-  gct_de_gct,
-  file.path("cmap_overlap", "de_log2FC_unmoderated.gct")
-)
-```
-
-```{r cmap_query}
-de_cmap_sig <- comp_res %>%
-  group_by(name, method, cell_line, drug, time) %>%
-  arrange(desc(concentration), desc(time), .by_group = TRUE) %>%
-  slice(1) %>%
-  ungroup() %>%
-  unnest(result) %>%
-  genebabel::join_hgnc("symbol", "symbol", select_cols = "entrez_id") %>%
-  drop_na(entrez_id) %>%
-  filter(padj < 0.05) %>%
-  mutate(
-    direction = ifelse(log2FoldChange > 0, "up", "down")
-  ) %>%
-  filter(!grepl("bari", condition, ignore.case = TRUE)) %>%
-  group_by(name, method, condition, direction) %>%
-  filter(n() >= 15) %>%
-  arrange(padj) %>%
-  slice(1:min(150, n())) %>%
-  summarize(
-    gmt = list(list(head = condition[1], desc = condition[1], len = n(), entry = entrez_id))
-  )
-
-
-cmapR::write.gmt(de_cmap_sig$gmt, file.path("cmap_overlap", "de_gene_lists.gmt"))
-
-de_cmap_sig %>%
-  # Make sure we have up and down for each set, otherwise remove
-  group_by(condition) %>%
-  filter(n() == 2) %>%
-  ungroup() %>%
-  # Query tool only supports 25 querys at once, selecting first 25 with biggest gene sets
-  spread(direction, gmt) %>%
-  mutate(n_genes = map2_int(up, down, ~.x$len + .y$len)) %>%
-  arrange(desc(n_genes)) %>%
-  group_by(name) %>%
-  slice(1:25) %>%
-  ungroup() %>%
-  gather("direction", "gmt", up, down) %>%
-  group_by(name, direction) %>%
-  group_nest() %>%
-  pwalk(
-    .,
-    function(name, direction, data) {
-      cmapR::write.gmt(data$gmt, file.path("cmap_overlap", paste0("de_gene_lists_", name, "_", direction, ".gmt")))
-    }
-  )
-
-```
-
-
-```{r cmap_query_result}
-
-
-```
 
 
