@@ -37,6 +37,9 @@ signature_meta <- syn("syn21547101") %>%
 comp_res <- syn("syn21559859") %>%
   read_rds()
 
+comp_res_by_conc <- syn("syn21559856") %>%
+  read_rds()
+
 compound_dict <- syn("syn21094266") %>%
   read_csv()
 
@@ -49,6 +52,9 @@ compound_name_map <- syn("syn21586544") %>%
 
 cmap_signatures_profiled <- syn("syn21747571") %>%
   read_rds()
+
+cmap_gene_meta <- syn("syn21547102") %>%
+  read_csv()
 
 ```
 
@@ -509,7 +515,7 @@ ribo_top_pcl <- clue_res_dge %>%
 
 ggsave(
   file.path(wd, "clue_match_ribociclib_pcl.pdf"),
-  ribo_top_hits,
+  ribo_top_pcl,
   width = 5, height = 10
 )
 
@@ -567,3 +573,125 @@ ggsave(
 )
 
 ```
+
+```{r dose_response}
+
+ensembl_hugo_map <- comp_res_by_conc %>%
+  pull("result") %>%
+  map("ensembl_gene_id") %>%
+  reduce(union) %>%
+  genebabel::query_hgnc("ensembl_gene_id")
+
+calculate_dose_response_l1000 <- function(meta, signatures, z_threshold = 1.645, method = "spearman") {
+  select_signatures <- signatures %>%
+    select(pr_gene_id, one_of(meta[["sig_id"]])) %>%
+    filter(
+      select(., -pr_gene_id) %>%
+          mutate_all(~abs(.x) >= z_threshold) %>%
+        purrr::reduce(magrittr::or)
+    )
+  select_signatures %>%
+    gather("sig_id", "z_score", -pr_gene_id) %>%
+    inner_join(
+      select(meta, sig_id, pert_dose), by = "sig_id"
+    ) %>%
+    group_by(pr_gene_id) %>%
+    summarize(test = list(suppressWarnings(cor.test(round(z_score, digits = 1), pert_dose, method = method)))) %>%
+    ungroup()
+}
+
+calculate_dose_response_dge <- function(data, p_threshold = 0.05) {
+  selected_signatures <- data %>%
+    select(condition, result) %>%
+    unnest(result) %>%
+    group_by(ensembl_gene_id) %>%
+    filter(any(na.omit(padj) <= p_threshold)) %>%
+    ungroup() %>%
+    select(condition, ensembl_gene_id, log2FoldChange)
+  selected_signatures %>%
+    inner_join(
+      select(data, condition, drug_conc), by = "condition"
+    ) %>%
+    drop_na(log2FoldChange) %>%
+    group_by(ensembl_gene_id) %>%
+    summarize(test = list(suppressWarnings(cor.test(round(log2FoldChange, digits = 1), drug_conc, method = "spearman")))) %>%
+    ungroup()
+}
+
+calculate_dose_response <- function(drug, cell, time, p_threshold = 0.05, method = "spearman") {
+  l1000 <- signature_meta %>%
+    filter(lspci_id == drug, cell_id == cell, if (!is.null(time)) pert_time == time else TRUE) %>%
+    select_if(negate(is.list)) %>%
+    calculate_dose_response_l1000(cmap_signatures_profiled, z_threshold = qnorm(1 - p_threshold), method = method) %>%
+    inner_join(select(cmap_gene_meta, pr_gene_id, symbol), by = "pr_gene_id")
+  dge <- comp_res_by_conc %>%
+    filter(drug == drug, cells == cell, if (!is.null(time)) replace_na(time == !!time, TRUE) else TRUE) %>%
+    calculate_dose_response_dge(p_threshold = p_threshold) %>%
+    inner_join(select(ensembl_hugo_map, ensembl_gene_id, symbol), by = "ensembl_gene_id")
+  list(
+    l1000 = l1000,
+    dge = dge
+  ) %>%
+    bind_rows(.id = "method") %>%
+    group_by(symbol) %>%
+    filter(length(unique(method)) == 2, n() == 2) %>%
+    ungroup() %>%
+    select(symbol, method, test)
+}
+
+palbo_dose_cor <- calculate_dose_response(
+  filter(compound_name_map, name == "palbociclib")$lspci_id,
+  "MCF7", time = 24
+)
+  signature_meta %>%
+  filter(pert_iname == "palbociclib", cell_id == "MCF7", pert_time == 24) %>%
+  select_if(negate(is.list)) %>%
+  calculate_dose_response_l1000(cmap_signatures_profiled, z_threshold = 2) %>%
+  inner_join(select(cmap_gene_meta, pr_gene_id, symbol), by = "pr_gene_id")
+
+
+palbo_dose_cor_dge <- comp_res_by_conc %>%
+  filter(drug == "Palbociclib", cells == "MCF7") %>%
+  calculate_dose_response_dge(p_threshold = 0.05) %>%
+  inner_join(select(ensembl_hugo_map, ensembl_gene_id, symbol), by = "ensembl_gene_id")
+
+palbo_dose_cor <- list(
+  l1000 = palbo_dose_cor_l1000,
+  dge = palbo_dose_cor_dge
+) %>%
+  bind_rows(.id = "method") %>%
+  group_by(symbol) %>%
+  filter(length(unique(method)) == 2, n() == 2) %>%
+  ungroup() %>%
+  select(symbol, method, test) %>%
+  spread(method, test) %>%
+  mutate(
+    significance = select(., dge, l1000) %>%
+      mutate_all(map_lgl, ~.x[["p.value"]] < 0.05) %>%
+      {
+        case_when(
+          .[["dge"]] & .[["l1000"]] ~ "both",
+          .[["dge"]] ~ "dge_only",
+          .[["l1000"]] ~ "l1000_only",
+          TRUE ~ "neither"
+        )
+      }
+  ) %>%
+  mutate_at(vars(dge, l1000), map_dbl, "estimate")
+
+palbo_dose_cor_plot <- palbo_dose_cor %>%
+  ggplot(aes(dge, l1000)) +
+    geom_hline(yintercept = c(-0.25, 0.25), color = "grey30") +
+    geom_vline(xintercept = c(-.25, .25), color = "grey30") +
+    geom_point() +
+    coord_equal(xlim = c(-1, 1), ylim = c(-1, 1)) +
+    labs(title = "Palbociclib dose-response correlation per gene")
+
+ggsave(
+  file.path(wd, "palbo_dose_cor_plot.pdf"),
+  palbo_dose_cor_plot,
+  width = 6, height = 5
+)
+```
+
+
