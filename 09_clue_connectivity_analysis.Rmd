@@ -31,11 +31,24 @@ clue_res <- syn("syn21646960") %>%
 pertubation_meta <- syn("syn21547097") %>%
   read_csv()
 
+signature_meta <- syn("syn21547101") %>%
+  read_csv()
+
 comp_res <- syn("syn21559859") %>%
   read_rds()
 
 compound_dict <- syn("syn21094266") %>%
   read_csv()
+
+compound_name_map <- syn("syn21586544") %>%
+  read_csv() %>%
+  distinct(
+    lspci_id,
+    name = str_to_lower(name)
+  )
+
+cmap_signatures_profiled <- syn("syn21747571") %>%
+  read_rds()
 
 ```
 
@@ -47,29 +60,86 @@ comp_res_clue <- comp_res %>%
       str_replace_all("[^\\w]", "")
   )
 
-clue_res_pert <- clue_res %>%
-  filter(result_type == "pert") %>%
+
+annotate_clue_res <- function(data, result_type, score_level, source, ...) {
+  data_out <- data
+  
+  if ("cell_id" %in% colnames(data))
+    data_out <- mutate_at(data_out, vars(cell_id), str_to_lower)
+  
+  data_out <- if (source == "dge") {
+    inner_join(
+      data_out,
+      comp_res_clue %>%
+        distinct(gene_set, dataset_query = dataset, cell_id_query = str_to_lower(cells), lspci_id_query = lspci_id),
+      by = "gene_set"
+    )
+  } else {
+    mutate(
+      data_out,
+      lspci_id_query = as.numeric(str_sub(gene_set, 2L))
+    )
+  } %>%
+    inner_join(
+      compound_dict %>%
+        transmute(lspci_id, name_query = str_to_lower(pref_name)),
+      by = c("lspci_id_query" = "lspci_id")
+    )
+  
+  if (result_type == "pert") {
+    data_out <- inner_join(
+      data_out,
+      pertubation_meta %>%
+        distinct(pert_id, lspci_id_target = lspci_id),
+      by = c("pert_id")
+    )
+  } else if (result_type == "pcl") {
+    data_out <- data_out %>%
+      mutate(
+        pert_id = id
+      ) %>%
+      separate(pert_id, into = c("pert_id", "cell_id"), sep = ":") %>%
+      mutate(
+        cell_id = as.character(cell_id) %>%
+          str_to_lower()
+      )
+  }
+  
+  data_out
+}
+
+clue_res_both <- clue_res %>%
   mutate(
     data = map(
       data,
-      ~.x %>%
-        {if("cell_id" %in% colnames(.)) mutate_at(., vars(cell_id), str_to_lower) else .} %>%
-        inner_join(
-          pertubation_meta %>%
-            distinct(pert_id, lspci_id_target = lspci_id),
-          by = "pert_id"
-        ) %>%
-        inner_join(
-          comp_res_clue %>%
-            distinct(gene_set, cell_id_query = str_to_lower(cells), lspci_id_query = lspci_id),
-          by = "gene_set"
-        )
+      group_nest,
+      source = if_else(str_starts(gene_set, fixed("X")), "l1000", "dge"),
+      keep = TRUE
+    )
+  ) %>%
+  unnest(data) %>%
+  mutate(
+    data = pmap(
+      .,
+      annotate_clue_res
     )
   )
 
+clue_res_dge <- clue_res_both %>%
+  filter(source == "dge")
+
+clue_res_l1000 <- clue_res_both %>%
+  filter(source == "l1000")
+
+clue_res_both <- clue_res_both %>%
+  group_by_at(vars(-source, -data)) %>%
+  summarize(data = list(bind_rows(data))) %>%
+  ungroup()
+
 cell_matching <- str_to_lower(unique(comp_res$cells)) %in% str_to_lower(unique(clue_res_pert$data[[1]]$cell_id))
 
-self_conn_plot <- function(df) {
+self_conn_plot <- function(df, label = pert_iname) {
+  label_q <- enquo(label)
   df %>%
   ggplot(aes(x = 0, y = tau)) +
   # geom_segment(
@@ -80,10 +150,11 @@ self_conn_plot <- function(df) {
     color = "red"
   ) +
   geom_text_repel(
-    aes(label = pert_iname),
+    aes(label = !!label_q),
     x = 0.05,
     nudge_x = 1,
-    hjust = 1
+    hjust = 1,
+    segment.color = "gray50"
   ) +
   theme_minimal() +
   theme(
@@ -97,7 +168,7 @@ self_conn_plot <- function(df) {
   labs(y = "CMap connectivity score", title = "Self-connectivity CMap")
 }
 
-cmap_match_all_summary <- clue_res_pert %>%
+cmap_match_all_summary <- clue_res_dge %>%
   filter(score_level == "summary") %>%
   chuck("data", 1) %>%
   filter(lspci_id_target == lspci_id_query) %>%
@@ -105,7 +176,8 @@ cmap_match_all_summary <- clue_res_pert %>%
   group_by(lspci_id_query) %>%
   slice(1) %>%
   ungroup() %>%
-  self_conn_plot()
+  self_conn_plot() +
+  labs(title = "Self-connectivity cells merged")
 
 ggsave(
   file.path(wd, "cmap_match_all_summary.pdf"),
@@ -113,7 +185,7 @@ ggsave(
   width = 3, height = 10
 )
 
-cmap_match_cell_cell <- clue_res_pert %>%
+cmap_match_cell_cell <- clue_res_dge %>%
   filter(score_level == "cell") %>%
   chuck("data", 1) %>%
   filter(lspci_id_target == lspci_id_query, cell_id == cell_id_query) %>%
@@ -121,7 +193,8 @@ cmap_match_cell_cell <- clue_res_pert %>%
   group_by(lspci_id_query) %>%
   slice(1) %>%
   ungroup() %>%
-  self_conn_plot()
+  self_conn_plot() +
+  labs(title = "Self-connectivity cells matched")
 
 ggsave(
   file.path(wd, "cmap_match_cell_cell.pdf"),
@@ -129,7 +202,7 @@ ggsave(
   width = 3, height = 10
 )
 
-cmap_match_cell_best_matching <- clue_res_pert %>%
+cmap_match_cell_best_matching <- clue_res_dge %>%
   filter(score_level == "cell") %>%
   chuck("data", 1) %>%
   filter(lspci_id_target == lspci_id_query) %>%
@@ -137,7 +210,8 @@ cmap_match_cell_best_matching <- clue_res_pert %>%
   group_by(lspci_id_query) %>%
   slice(1) %>%
   ungroup() %>%
-  self_conn_plot()
+  self_conn_plot() +
+  labs(title = "Self-connectivity best matching cell")
 
 ggsave(
   file.path(wd, "cmap_match_cell_best_matching.pdf"),
@@ -145,15 +219,16 @@ ggsave(
   width = 3, height = 10
 )
 
-cmap_match_cell_worst_matching <- clue_res_pert %>%
+cmap_match_cell_worst_matching <- clue_res_dge %>%
   filter(score_level == "cell") %>%
   chuck("data", 1) %>%
   filter(lspci_id_target == lspci_id_query) %>%
   arrange(tau) %>%
   group_by(lspci_id_query) %>%
-  slice() %>%
+  slice(1) %>%
   ungroup() %>%
-  self_conn_plot()
+  self_conn_plot() +
+  labs(title = "Self-connectivity worst matching cell")
 
 ggsave(
   file.path(wd, "cmap_match_cell_worst_matching.pdf"),
@@ -161,19 +236,33 @@ ggsave(
   width = 3, height = 10
 )
 
-clue_match_best_vs_worst <- clue_res_pert %>%
+clue_match_best_vs_worst <- clue_res_dge %>%
   filter(score_level == "cell") %>%
   chuck("data", 1) %>%
   filter(lspci_id_target == lspci_id_query) %>%
-  arrange(desc(tau)) %>%
+  arrange(tau) %>%
   group_by(lspci_id_query) %>%
   # Make sure that drugs have been profiled in adequate number of cell lines
+  filter(n() >= 4) %>%
   slice(c(1, n())) %>%
-  mutate(match = c("best", "worst")) %>%
+  mutate(match = factor(c("worst", "best"), levels = c("best", "worst", ""))) %>%
   ungroup() %>%
   ggplot(aes(match, tau, group = lspci_id_query)) +
     geom_line() +
-    labs(x = "CMap cell line match", y = "Connectivity score")
+    labs(x = "CMap cell line match", y = "Connectivity score") +
+    scale_x_discrete(drop = FALSE) +
+    geom_text_repel(
+      aes(label = pert_iname, x = "worst"),
+      data = ~.x %>%
+        filter(match == "worst"),
+      nudge_x = 2,
+      hjust = 1,
+      segment.color = "gray50"
+    ) +
+    geom_point(
+      color = "red"
+    ) +
+  labs(title = "Self-connectivity best and worst matching cell")
   
 ggsave(
   file.path(wd, "clue_match_best_vs_worst.pdf"),
@@ -181,7 +270,199 @@ ggsave(
   width = 5, height = 10
 )
 
+```
 
+
+```{r top_per_drug}
+
+top_hit_plot <- function(df, label = "pert_iname") {
+  label_q <- sym(label)
+  ggplot(df, aes(x = 0, y = tau)) +
+  geom_text_repel(
+    aes(y = tau, label = !!label_q),
+    hjust = 1,
+    nudge_x = rep_len(nrow(df), 1),
+    nudge_y = df$tau_rescaled - df$tau,
+    force = 0,
+    segment.color = "gray50"
+  ) +
+  geom_point(
+    color = "red"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank()
+  ) +
+  coord_cartesian(xlim = c(0, 1)) +
+  labs(y = "CMap connectivity score")
+}
+
+find_draw_top_hits <- function(
+  df,
+  n_top = 10,
+  ...,
+  plot_args = list()
+) {
+  dots <- list(...)
+  filter_args <- dots %>%
+    magrittr::extract(intersect(colnames(df), names(.)))
+  plot_data <- df %>%
+    filter(
+      imap(., ~if (.y %in% names(filter_args)) .x %in% filter_args[[.y]] else TRUE) %>%
+        reduce(magrittr::and)
+    ) %>%
+    group_by(pert_id) %>%
+    arrange(desc(tau), .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    arrange(desc(tau)) %>%
+    slice(seq_len(n_top)) %>%
+    mutate(tau_rescaled = scales::rescale(-seq_len(n()), to = c(min(tau), max(tau))))
+  exec(top_hit_plot, plot_data, !!!plot_args) +
+    labs(title = paste0("Top ", n_top, " hits"))
+}
+
+palbo_plot <- clue_res_dge %>%
+  filter(score_level == "cell") %>%
+  chuck("data", 1) %>%
+  find_draw_top_hits(
+    n_top = 30,
+    pert_type = "trt_cp",
+    lspci_id_query = filter(compound_name_map, name == "Palbociclib")$lspci_id,
+    plot_args = list(label = "pert_iname")
+  )
+
+alvo_plot <- clue_res_dge %>%
+  filter(score_level == "cell") %>%
+  chuck("data", 1) %>%
+  find_draw_top_hits(
+    n_top = 30,
+    pert_type = "trt_cp",
+    lspci_id_query = filter(compound_name_map, name == "Alvocidib")$lspci_id,
+    plot_args = list(label = "pert_iname")
+  )
+
+alvo_plot_l1000 <- clue_res_l1000 %>%
+  filter(score_level == "cell") %>%
+  chuck("data", 1) %>%
+  find_draw_top_hits(
+    n_top = 30,
+    pert_type = "trt_cp",
+    lspci_id_query = filter(compound_name_map, name == "Alvocidib")$lspci_id,
+    plot_args = list(label = "pert_iname")
+  )
+
+top_hit_comp_plot <- function(df, label = "pert_iname") {
+  label_q <- sym(label)
+  label_data <- df %>%
+    filter(source == tail(levels(source), 1)) %>%
+    mutate(tau_rescaled = scales::rescale(-seq_len(n()), to = c(min(df[["tau"]]), max(df[["tau"]]))))
+  n_sources <- length(levels(df[["source"]]))
+  df %>%
+    ggplot(aes(x = source, y = tau)) +
+    geom_line(
+      aes(group = pert_id)
+    ) +
+    theme_minimal() +
+    geom_text_repel(
+      aes(x = n_sources, y = tau, label = !!label_q),
+      data = label_data,
+      hjust = 1,
+      nudge_x = rep_len(nrow(label_data), n_sources + 2),
+      nudge_y = label_data$tau_rescaled - label_data$tau,
+      force = 0,
+      segment.color = "gray50"
+    ) +
+    geom_point(
+      color = "red"
+    ) +
+    # theme(
+    #   panel.grid.major.x = element_blank(),
+    #   panel.grid.minor.x = element_blank(),
+    #   axis.ticks.x = element_blank(),
+    #   axis.text.x = element_blank(),
+    #   axis.title.x = element_blank()
+    # ) +
+    coord_cartesian(xlim = c(0.5, n_sources + 3),  expand = FALSE) +
+    labs(y = "CMap connectivity score")
+}
+
+
+find_draw_top_hit_comps <- function(
+  df,
+  n_top = 10,
+  ...,
+  plot_args = list()
+) {
+  dots <- list(...)
+  filter_args <- dots %>%
+    magrittr::extract(intersect(colnames(df), names(.)))
+  sources <- unique(df[["source"]])
+  plot_data <- df %>%
+    mutate(source = factor(source, levels = sources)) %>%
+    filter(
+      imap(., ~if (.y %in% names(filter_args)) .x %in% filter_args[[.y]] else TRUE) %>%
+        reduce(magrittr::and)
+    ) %>%
+    group_by(pert_id, source) %>%
+    arrange(desc(tau), .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    filter(
+      pert_id %in% (
+        group_by(., source) %>%
+          arrange(desc(tau), .by_group = TRUE) %>%
+          slice(seq_len(n_top)) %>%
+          ungroup() %>%
+          pull(pert_id)
+      )
+    )
+  exec(top_hit_comp_plot, plot_data, !!!plot_args) +
+    labs(title = paste0("Top ", n_top, " hits"))
+}
+
+top_hits_both_alvocidib <- clue_res_both %>%
+  filter(score_level == "cell", result_type == "pert") %>%
+  chuck("data", 1) %>%
+  find_draw_top_hit_comps(
+    pert_type = "trt_cp",
+    lspci_id_query = filter(compound_name_map, name == "alvocidib")$lspci_id,
+    n_top = 20
+  ) +
+  labs(title = "Top 20 hits for Alvocidib")
+
+top_hits_both_alvocidib <- clue_res_both %>%
+  filter(score_level == "cell", result_type == "pert") %>%
+  chuck("data", 1) %>%
+  filter(lspci_id_query == 21311, lspci_id_target == 21311)
+
+
+ggsave(
+  file.path(wd, "clue_match_alvocidib_dge_vs_l1000.pdf"),
+  top_hits_both_alvocidib,
+  width = 5, height = 10
+)
+
+top_hits_both_alvocidib_pcl <- clue_res_both %>%
+  filter(score_level == "cell", result_type == "pcl") %>%
+  chuck("data", 1) %>%
+  find_draw_top_hit_comps(
+    pert_type = "trt_cp",
+    lspci_id_query = filter(compound_name_map, name == "alvocidib")$lspci_id,
+    n_top = 20,
+    plot_args = list(label = "pert_id")
+  ) +
+  labs(title = "Top 20 hits for Alvocidib")
+
+ggsave(
+  file.path(wd, "clue_match_alvocidib_dge_vs_l1000_pcl.pdf"),
+  top_hits_both_alvocidib_pcl,
+  width = 8, height = 10
+)
 ```
 
 
@@ -193,8 +474,96 @@ drugs_dge <- comp_res %>%
 
 pertubation_meta
 
-drugs_dge_not_cmap <- compound_dict %>%
-  filter(lspci_id %in% drugs_dge[!drugs_dge %in% pertubation_meta$lspci_id])
+drugs_dge_not_cmap <- comp_res %>%
+  filter(lspci_id %in% drugs_dge[!drugs_dge %in% pertubation_meta$lspci_id]) %>%
+  select_if(negate(is.list))
 
+ribo_top_hits <- clue_res_dge %>%
+  filter(score_level == "cell") %>%
+  chuck("data", 1) %>%
+  find_draw_top_hits(
+    n_top = 30,
+    pert_type = "trt_cp",
+    lspci_id_query = filter(compound_name_map, name == "ribociclib")$lspci_id,
+    plot_args = list(label = "pert_iname")
+  ) +
+  labs(title = "Top 30 hits for Ribociclib (DGE)")
+
+ggsave(
+  file.path(wd, "clue_match_ribociclib.pdf"),
+  ribo_top_hits,
+  width = 5, height = 10
+)
+
+ribo_top_pcl <- clue_res_dge %>%
+  filter(score_level == "cell", result_type == "pcl") %>%
+  chuck("data", 1) %>%
+  filter(str_starts(pert_id, fixed("CP"))) %>%
+  find_draw_top_hits(
+    n_top = 30,
+    pert_type = "trt_cp",
+    lspci_id_query = filter(compound_name_map, name == "ribociclib")$lspci_id,
+    plot_args = list(label = "pert_id")
+  ) +
+  labs(title = "Top 30 hits for Ribociclib (DGE)")
+
+ggsave(
+  file.path(wd, "clue_match_ribociclib_pcl.pdf"),
+  ribo_top_hits,
+  width = 5, height = 10
+)
+
+xl019_top_hits <- clue_res_dge %>%
+  filter(score_level == "cell", result_type == "pert") %>%
+  chuck("data", 1) %>%
+  find_draw_top_hits(
+    n_top = 30,
+    pert_type = "trt_cp",
+    lspci_id_query = filter(compound_name_map, name == "xl019")$lspci_id,
+    plot_args = list(label = "pert_iname")
+  ) +
+  labs(title = "Top 30 hits for XL019 (DGE)")
+
+ggsave(
+  file.path(wd, "clue_match_xl019.pdf"),
+  xl019_top_hits,
+  width = 5, height = 10
+)
+
+xl019_top_pcl <- clue_res_dge %>%
+  filter(score_level == "cell", result_type == "pcl") %>%
+  chuck("data", 1) %>%
+  filter(str_starts(pert_id, fixed("CP"))) %>%
+  find_draw_top_hits(
+    n_top = 30,
+    pert_type = "trt_cp",
+    lspci_id_query = filter(compound_name_map, name == "xl019")$lspci_id,
+    plot_args = list(label = "pert_id")
+  ) +
+  labs(title = "Top 30 hits for XL1019 (DGE)")
+
+ggsave(
+  file.path(wd, "clue_match_xl019_pcl.pdf"),
+  xl019_top_pcl,
+  width = 5, height = 10
+)
+
+vlx1570_top_pcl <- clue_res_dge %>%
+  filter(score_level == "cell", result_type == "pcl") %>%
+  chuck("data", 1) %>%
+  filter(str_starts(pert_id, fixed("CP"))) %>%
+  find_draw_top_hits(
+    n_top = 30,
+    pert_type = "trt_cp",
+    lspci_id_query = filter(compound_name_map, name == "vlx1570")$lspci_id,
+    plot_args = list(label = "pert_id")
+  ) +
+  labs(title = "Top 30 hits for VLX1570 (DGE)")
+
+ggsave(
+  file.path(wd, "clue_match_vlx1570_pcl.pdf"),
+  vlx1570_top_pcl,
+  width = 5, height = 10
+)
 
 ```

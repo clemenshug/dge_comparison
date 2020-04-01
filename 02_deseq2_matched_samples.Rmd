@@ -10,10 +10,15 @@ library(tidyverse)
 library(DESeq2)
 library(VennDiagram)
 library(UpSetR)
+library(synapser)
 
 paste_ <- function(...) {
   paste(..., sep = "_")
 }
+
+synapser::synLogin()
+
+syn <- synExtra::synDownloader( "~/data/AMP-AD/figs" )
 ```
 
 Comparing the differentially expressed genes between Bulk RNA-seq and DGE with
@@ -565,5 +570,29 @@ purrr::pwalk(
 )
 
 
+
+```
+
+
+# Upload to synapse
+
+```{r upload_synapse}
+intermediates_synid <- "syn18501301"
+count_wrangling_activity <- synapser::Activity(
+  name = "Wrangling CDK4/6 count data",
+  executed = "https://github.com/clemenshug/dge_comparison/commit/0d7388ef14bfbe949bffc199cc95c6b449567bcd"
+)
+
+cdk_folder_synid <- synapser::Folder(
+  "cdk",
+  parent = intermediates_synid
+) %>%
+  synapser::synStore()
+
+cdk_counts_synid <- synapser::File(
+  file.path("deseq", "count_data.csv.gz"),
+  parent = cdk_folder_synid
+) %>%
+  synapser::synStore(activity = count_wrangling_activity, forceVersion = FALSE)
 
 ```

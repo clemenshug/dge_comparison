@@ -3,6 +3,7 @@
 # library(synExtra)
 library(tidyverse)
 library(patchwork)
+library(here)
 
 # synapser::synLogin()
 # syn <- synExtra::synDownloader("~/data/DGE_comp/")
@@ -23,25 +24,35 @@ theme_set(theme_light())
 
 
 ```{r datasets}
+data_sets <- tibble(name = c("cdk", "ad", "dub", "cdk_new"))
 
-deseq <- readr::read_rds(file.path("deseq", "deseq_datasets.rds"))
-counts <- readr::read_csv(file.path("deseq", "count_data.csv.gz"))
+data_sets <- data_sets %>%
+  mutate(
+    meta = map(name, ~read_csv(file.path("wrangled", .x, "meta.csv"))),
+    counts = map(name, ~read_csv(file.path("wrangled", .x, "counts.csv.gz")))
+  )
 
-ensembl_gene_id_mapping <- readr::read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv")) 
 
 l1000 <- readr::read_csv(file.path("wrangled", "l1000_gene_list.csv"))
-l1000_ensembl_gene_ids <- l1000 %>%
-  dplyr::left_join(ensembl_gene_id_mapping, by = c("gene_symbol" = "symbol")) %>%
-  tidyr::drop_na(ensembl_gene_id) %>%
-  .$ensembl_gene_id
+
 
 ```
 
 
+```{r counts}
+raw_counts <- data_sets %>%
+  unnest(counts) %>%
+  dplyr::select(name, symbol, sample_id, count) %>%
+  inner_join(data_sets$meta %>% bind_rows() %>% dplyr::select(sample_id, method), by = "sample_id")
+ 
+counts <- here("deseq", "count_data.csv.gz") %>%
+  read_csv()
+
+```
+
 ```{r sequencing_depth}
-seq_depth <- counts %>%
-  filter(comparison %in% c("dge", "bulk"), normalization == "raw") %>%
-  group_by(comparison, sample_id) %>%
+seq_depth <- raw_counts %>%
+  group_by(name, method, sample_id) %>%
   summarize(depth = sum(count)) %>%
   ungroup()
 ```
@@ -50,18 +61,94 @@ seq_depth <- counts %>%
 ```{r sequencin_depth_plots}
 seq_depth_violin <- seq_depth %>%
   # Get rid out outlier bulk which has < 1000 counts
-  filter(depth > 1000) %>%
-  ggplot(aes(comparison, depth)) +
+  # filter(depth > 1000) %>%
+  ggplot(aes(name, depth)) +
     geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
     scale_y_log10() +
     geom_label(
-      aes(comparison, ypos, label = median),
+      aes(name, ypos, label = median),
       data = . %>%
-        group_by(comparison) %>%
+        group_by(name, method) %>%
         summarize(median = format(median(depth), big.mark = ",", scientific = FALSE), ypos = median(depth)),
       label.size = 0
-    )
+    ) +
+    facet_wrap(vars(method))
 dir.create("descriptive_stats", showWarnings = FALSE)
-ggsave(file.path("descriptive_stats", "sequencing_depth_violin.pdf"), width = 4.5, height = 4.5)
+ggsave(here("descriptive_stats", "sequencing_depth_violin.pdf"), width = 5.5, height = 4.5)
 ```
+
+```{r pca}
+pca_plot <- function (data, meta, aes = ggplot2::aes(PC1, PC2), extra_layers = NULL, ...) {
+  p <- prcomp(data, ...)
+  pstats <- t(summary(p)$importance) %>%
+    tibble::as_tibble(rownames = "component") %>%
+    dplyr::rename(sdev = `Standard deviation`, prop_var = `Proportion of Variance`, cum_prop = `Cumulative Proportion`) %>%
+    dplyr::mutate(component = factor(component, levels = unique(component))) %>%
+    # Remove all components after cumsum reaches .999
+    dplyr::filter(cumsum(dplyr::lag(cum_prop > .95, default = FALSE)) <= 1) %>%
+    # Maximum 10 components
+    dplyr::slice(1:min(10, n()))
+  ploadings <- p$x %>%
+    tibble::as_tibble() %>%
+    dplyr::bind_cols(meta)
+  p_plot <- ggplot(ploadings, aes) +
+    geom_point()
+  if (!is.null(extra_layers))
+    p_plot <- p_plot + extra_layers
+  # var_plot <- ggplot(pstats, ggplot2::aes(x = 1, y = prop_var, fill = component)) +
+  #   geom_col(position = "stack") +
+  #   # geom_text(ggplot2::aes(y = cum_prop, label = prop_var), halign = 0, valign = 1) +
+  #   coord_flip() +
+  #   guides(fill = FALSE)
+    # theme(legend.position = "bottom")
+  # browser()
+  var_table <- gridExtra::tableGrob(
+    pstats %>%
+      dplyr::select(component, prop_var) %>%
+      dplyr::mutate(prop_var = formatC(prop_var * 100, digits = 3, format = "fg")) %>%
+      tidyr::spread(component, prop_var),
+    rows = NULL,
+    theme = gridExtra::ttheme_default(base_size = 6)
+  )
+  patchwork::wrap_plots(p_plot, var_table, heights = c(5, 1), ncol = 1)
+}
+
+
+cdk_new_meta <- data_sets %>%
+  filter(name == "cdk_new", ) %>%
+  pluck("meta", 1) %>%
+  filter(sample_id %in% colnames(cdk_new_pca_data)) %>%
+  arrange(sample_id) %>%
+  column_to_rownames("sample_id")
+
+cdk_new_pca_data <- counts %>%
+  filter(name == "cdk_new", normalization == "variance_stabilized") %>%
+  arrange(sample_id) %>%
+  select(gene_id, sample_id, count) %>%
+  spread(sample_id, count) %>%
+  column_to_rownames("gene_id")
+
+
+
+dge_pca_plot <- pca_plot(
+  t(cdk_new_pca_data),
+  cdk_new_meta %>%
+    mutate_at(vars(time), as.factor),
+  aes(PC1, PC2, shape = cell_line, color = drug, size = concentration, alpha = 0.7),
+  extra_layers = list(
+    # scale_shape_manual(values = 21:25),
+    # scale_color_viridis_d()
+    # scale_color_continuous(trans = "log10")
+    facet_wrap(~time)
+    # scale_color_brewer(palette = "Set2")
+  )
+  # extra_layers = list(
+  #   scale_color_continuous(trans = "log10"),
+  #   labs(title = "MCF7 Abemaciclib")
+  # )
+)
+
+ggsave(here("deseq", "cdk_new_all_pca_pc1_pc2.pdf"), width = 6, height = 6)
+```
+
 

@@ -20,37 +20,17 @@ theme_set(theme_minimal())
 Compare significantly differential expressed genes between RNA-seq and DGE.
 
 ```{r loading}
-deseq_treatment_vs_control_log_model <- read_rds(file.path("deseq", "deseq_treatment_vs_control_log_model.rds"))
+# deseq_treatment_vs_control_log_model <- read_rds(file.path("deseq", "deseq_treatment_vs_control_log_model.rds"))
+results_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_control_result.rds"))
 deseq_treatment_vs_control <- read_rds(file.path("deseq", "deseq_treatment_vs_control.rds"))
-ensembl_gene_id_mapping <- read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv"))
+# ensembl_gene_id_mapping <- read_csv(file.path("wrangled", "ensembl_gene_id_mapping.csv"))
 ```
 
+Obtain unmoderaded log2fold changes 
 
-Kartik uses a FDR cutoff of 0.2, use also for this analysis in order to make
-comparision with his gene lists easier.
+```{r unmoderated_lfc}
 
-```{r cutoff}
-alpha_thresh <- 0.2
 
-# Rerun fetching the deseq results because we want to use alpha = .2
-deseq_treatment_vs_control_log_model <- deseq_treatment_vs_control_log_model %>%
-  mutate(
-    deseq_res = map(
-      deseq,
-      function(de) {
-        res <- DESeq2::results(de, alpha = alpha_thresh)
-      }
-    )
-  )
-deseq_treatment_vs_control <- deseq_treatment_vs_control %>%
-  mutate(
-    deseq_res = map(
-      deseq,
-      function(de) {
-        res <- DESeq2::results(de, alpha = alpha_thresh)
-      }
-    )
-  )
 ```
 
 
@@ -110,16 +90,15 @@ density_2d_plot <- function (
 
 dge_bulk_long_res <- function(deseq_res_df) {
   dge_bulk_res <- deseq_res_df %>%
-    select(method, condition, deseq_res) %>%
+    select(name, method, condition, result) %>%
     # Remove conditions without matching dge + bulk
-    group_by(condition) %>%
+    group_by(name, condition) %>%
     filter(length(unique(method)) == 2) %>%
     ungroup() %>%
-    mutate(deseq_res = map(deseq_res, as_tibble, rownames = "gene_id")) %>%
-    unnest(deseq_res)
+    unnest(result)
 
   dge_bulk_sign <- dge_bulk_res %>%
-    select(method, condition, gene_id, padj) %>%
+    select(name, method, condition, symbol, padj) %>%
     spread(method, padj) %>%
     mutate(
       significance = case_when(
@@ -130,12 +109,12 @@ dge_bulk_long_res <- function(deseq_res_df) {
       ) %>%
         factor(levels = rev(c("both", "bulk_only", "dge_only", "neither")))
     ) %>%
-    select(condition, gene_id, significance)
+    select(name, condition, symbol, significance)
   
   dge_bulk_long_res <- dge_bulk_res %>%
-    gather("var", "value", -method, -gene_id, -condition) %>%
+    gather("var", "value", -name, -method, -symbol, -condition) %>%
     spread(method, value) %>%
-    left_join(dge_bulk_sign, by = c("condition", "gene_id")) %>%
+    left_join(dge_bulk_sign, by = c("name", "condition", "symbol")) %>%
     arrange(significance)
   dge_bulk_long_res
 }
@@ -164,13 +143,23 @@ dge_bulk_res_cor_plot <- function(deseq_res_df) {
   dge_bulk_corr_plot
 }
 
-dge_bulk_corr_plot_log_model <- dge_bulk_res_cor_plot(
-  deseq_treatment_vs_control_log_model %>%
-    mutate(
-      condition = paste(cell_line, drug, paste0(time, " h"), sep = " ")
-    ) %>%
-    dge_bulk_long_res()
-)
+# dge_bulk_corr_plot_log_model <- dge_bulk_res_cor_plot(
+#   deseq_treatment_vs_control_log_model %>%
+#     mutate(
+#       condition = paste(cell_line, drug, paste0(time, " h"), sep = " ")
+#     ) %>%
+#     dge_bulk_long_res()
+# )
+
+alpha_thresh <- 0.05
+
+comp_dge_bulk_long <- results_treatment_vs_control %>%
+  mutate(
+    condition = paste(cell_line, drug, paste0(concentration, " µM"), paste0(time, " h"), sep = " ")
+  ) %>%
+  dge_bulk_long_res()
+
+comp_dge_bulk_cor_plot <- dge_bulk_res_cor_plot(comp_dge_bulk_long)
 
 dge_bulk_corr_plot <- dge_bulk_res_cor_plot(
   deseq_treatment_vs_control %>%
@@ -376,8 +365,7 @@ dge_bulk_kartik_upset_plot <- dge_bulk_kartik_venn_data %>%
       }
     )
   ) %>%
-  pull(venn) 
-%>%
+  pull(venn) %>%
   patchwork::wrap_plots()
 ggsave(
   file.path("overlap_de", "dge_bulk_kartik_venn.png"),

@@ -30,8 +30,7 @@ results <- comp_results %>%
   unnest(result)
 
 results_meta <- results %>%
-  select(name, condition, method, cell_line, drug, concentration, time) %>%
-  distinct() %>%
+  distinct(name, condition, method, cell_line, drug, concentration, time) %>%
   mutate(time = as.character(time))
 ```
 
@@ -46,7 +45,14 @@ Clustering only CDK for now, only one with matching DGE and bulk RNA-seq
 
 ```{r clustering_cdk}
 results_meta_cdk <- results_meta %>%
-  filter(name == "cdk")
+  filter(
+    case_when(
+      name == "cdk_new" ~ TRUE,
+      name == "cdk" & method == "bulk" ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    cell_line %in% c("MCF7", "PDX1258", "Hs578T")
+  )
 
 results_cdk <- results %>%
   filter(condition %in% results_meta_cdk$condition)
@@ -68,6 +74,11 @@ parameter_cmaps <- results_meta_cdk %>%
   {set_names(.$palette, .$col)}
 
 lfc_matrix_cdk <- results_cdk %>%
+  # filter(time == 24, concentration == 1) %>%
+  mutate(log2FoldChange = log2FoldChange_MLE) %>%
+  group_by(symbol) %>%
+  filter(any(padj < 0.05)) %>%
+  ungroup() %>%
   select(condition, symbol, log2FoldChange) %>%
   spread(condition, log2FoldChange) %>%
   drop_na() %>%
@@ -77,14 +88,14 @@ lfc_matrix_cdk <- results_cdk %>%
 # lfc_log_model_cor_matrix <- 1 - cor(lfc_log_model_matrix, method = "spearman")
 
 clust_cols <- hclust(
-  as.dist(1 - cor(lfc_matrix_cdk, method = "spearman")),
-  # dist(t(lfc_log_model_matrix), method = "euclidian"),
+  as.dist(1 - cor(lfc_matrix_cdk, method = "pearson")),
+  # dist(t(lfc_matrix_cdk), method = "euclidian"),
   method = "average"
 )
 
 clust_rows <- hclust(
-  as.dist(1 - cor(t(lfc_matrix_cdk), method = "spearman")),
-  # dist(lfc_log_model_matrix, method = "euclidian"),
+  as.dist(1 - cor(t(lfc_matrix_cdk), method = "pearson")),
+  # dist(lfc_matrix_cdk, method = "euclidian"),
   method = "average"
 )
 
@@ -100,8 +111,9 @@ lf_hm_cdk <- pheatmap::pheatmap(
     select(condition, cell_line, method, drug, concentration, time) %>%
     column_to_rownames("condition"),
   annotation_colors = parameter_cmaps,
-  silent = TRUE
+  silent = TRUE,
+  show_colnames = FALSE
 )
-ggsave(file.path("deseq", "cdk_log2fc_hc_spearman_average.pdf"), lf_hm_cdk, width = 10, height = 10)
+ggsave(file.path("deseq", "cdk_all_log2fc_mle_pearson_average.pdf"), lf_hm_cdk, width = 10, height = 10)
 ```
 

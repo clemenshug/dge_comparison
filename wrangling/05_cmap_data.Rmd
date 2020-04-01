@@ -217,7 +217,12 @@ gene_meta_identical <- gene_meta_raw %>%
 
 gene_meta <- gene_meta_raw %>%
   filter(dataset == "GSE92742") %>%
-  genebabel::join_hgnc("pr_gene_symbol", c("symbol", "alias_symbol", "prev_symbol"), "symbol") %>%
+  mutate_at(vars(pr_gene_id), as.character) %>%
+  genebabel::join_hgnc(
+    "pr_gene_id",
+    "entrez_id",
+    c("symbol", "entrez_id", "ensembl_gene_id")
+  ) %>%
   select(-dataset)
 
 write_csv(gene_meta, file.path("..", "wrangled", "cmap_gene_meta.csv.gz"))

@@ -112,5 +112,4 @@ c(
 ) %>%
   synStoreMany(parentId = "syn21558153", activity = activity)
 
-#rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens/
 ```
