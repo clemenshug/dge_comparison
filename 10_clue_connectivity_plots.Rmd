@@ -1,7 +1,7 @@
 ---
 title: "Clue connectivity analysis"
 author: "Clemens Hug"
-date: "2/6/2019"
+date: "4/1/2020"
 output: html_document
 ---
 
@@ -25,24 +25,6 @@ theme_set(theme_bw())
 
 
 ```{r load}
-clue_res <- syn("syn21646960") %>%
-  read_rds()
-
-pertubation_meta <- syn("syn21547097") %>%
-  read_csv()
-
-signature_meta <- syn("syn21547101") %>%
-  read_csv()
-
-comp_res <- syn("syn21559859") %>%
-  read_rds()
-
-comp_res_by_conc <- syn("syn21559856") %>%
-  read_rds()
-
-compound_dict <- syn("syn21094266") %>%
-  read_csv()
-
 compound_name_map <- syn("syn21586544") %>%
   read_csv() %>%
   distinct(
@@ -56,126 +38,53 @@ cmap_signatures_profiled <- syn("syn21747571") %>%
 cmap_gene_meta <- syn("syn21547102") %>%
   read_csv()
 
+clue_res_dge <- syn("syn21907139") %>%
+  read_rds()
+
+clue_res_l1000 <- syn("syn21907143") %>%
+  read_rds()
+
+clue_res_combined <- syn("syn21907166") %>%
+  read_rds()
+
 ```
 
-```{r match_conditions}
-comp_res_clue <- comp_res %>%
-  mutate(
-    gene_set = paste(dataset, drug, cells, drug, stim, stim_conc, time, sep = "_") %>%
-      str_replace_all("\\s", "_") %>%
-      str_replace_all("[^\\w]", "")
-  )
 
 
-annotate_clue_res <- function(data, result_type, score_level, source, ...) {
-  data_out <- data
-  
-  if ("cell_id" %in% colnames(data))
-    data_out <- mutate_at(data_out, vars(cell_id), str_to_lower)
-  
-  data_out <- if (source == "dge") {
-    inner_join(
-      data_out,
-      comp_res_clue %>%
-        distinct(gene_set, dataset_query = dataset, cell_id_query = str_to_lower(cells), lspci_id_query = lspci_id),
-      by = "gene_set"
-    )
-  } else {
-    mutate(
-      data_out,
-      lspci_id_query = as.numeric(str_sub(gene_set, 2L))
-    )
-  } %>%
-    inner_join(
-      compound_dict %>%
-        transmute(lspci_id, name_query = str_to_lower(pref_name)),
-      by = c("lspci_id_query" = "lspci_id")
-    )
-  
-  if (result_type == "pert") {
-    data_out <- inner_join(
-      data_out,
-      pertubation_meta %>%
-        distinct(pert_id, lspci_id_target = lspci_id),
-      by = c("pert_id")
-    )
-  } else if (result_type == "pcl") {
-    data_out <- data_out %>%
-      mutate(
-        pert_id = id
-      ) %>%
-      separate(pert_id, into = c("pert_id", "cell_id"), sep = ":") %>%
-      mutate(
-        cell_id = as.character(cell_id) %>%
-          str_to_lower()
-      )
-  }
-  
-  data_out
-}
-
-clue_res_both <- clue_res %>%
-  mutate(
-    data = map(
-      data,
-      group_nest,
-      source = if_else(str_starts(gene_set, fixed("X")), "l1000", "dge"),
-      keep = TRUE
-    )
-  ) %>%
-  unnest(data) %>%
-  mutate(
-    data = pmap(
-      .,
-      annotate_clue_res
-    )
-  )
-
-clue_res_dge <- clue_res_both %>%
-  filter(source == "dge")
-
-clue_res_l1000 <- clue_res_both %>%
-  filter(source == "l1000")
-
-clue_res_both <- clue_res_both %>%
-  group_by_at(vars(-source, -data)) %>%
-  summarize(data = list(bind_rows(data))) %>%
-  ungroup()
-
-cell_matching <- str_to_lower(unique(comp_res$cells)) %in% str_to_lower(unique(clue_res_pert$data[[1]]$cell_id))
-
+```{r connectivity_plots}
 self_conn_plot <- function(df, label = pert_iname) {
   label_q <- enquo(label)
   df %>%
-  ggplot(aes(x = 0, y = tau)) +
-  # geom_segment(
-  #   aes(yend = normalized_score),
-  #   xend = 0.2
-  # ) +
-  geom_point(
-    color = "red"
-  ) +
-  geom_text_repel(
-    aes(label = !!label_q),
-    x = 0.05,
-    nudge_x = 1,
-    hjust = 1,
-    segment.color = "gray50"
-  ) +
-  theme_minimal() +
-  theme(
-    panel.grid.major.x = element_blank(),
-    panel.grid.minor.x = element_blank(),
-    axis.ticks.x = element_blank(),
-    axis.text.x = element_blank(),
-    axis.title.x = element_blank()
-  ) +
-  coord_cartesian(xlim = c(0, 1)) +
-  labs(y = "CMap connectivity score", title = "Self-connectivity CMap")
+    ggplot(aes(x = 0, y = tau)) +
+    # geom_segment(
+    #   aes(yend = normalized_score),
+    #   xend = 0.2
+    # ) +
+    geom_point(
+      color = "red"
+    ) +
+    geom_text_repel(
+      aes(label = !!label_q),
+      x = 0.05,
+      nudge_x = 1,
+      hjust = 1,
+      segment.color = "gray50"
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank()
+    ) +
+    coord_cartesian(xlim = c(0, 1)) +
+    labs(y = "CMap connectivity score", title = "Self-connectivity CMap")
 }
 
+# Query using DGE, taking best matching target cell line
 cmap_match_all_summary <- clue_res_dge %>%
-  filter(score_level == "summary") %>%
+  filter(score_level == "summary", result_type == "pert") %>%
   chuck("data", 1) %>%
   filter(lspci_id_target == lspci_id_query) %>%
   arrange(desc(tau)) %>%
@@ -191,10 +100,11 @@ ggsave(
   width = 3, height = 10
 )
 
+# Query using DGE, taking only matching cell line
 cmap_match_cell_cell <- clue_res_dge %>%
-  filter(score_level == "cell") %>%
+  filter(score_level == "cell", result_type == "pert") %>%
   chuck("data", 1) %>%
-  filter(lspci_id_target == lspci_id_query, cell_id == cell_id_query) %>%
+  filter(lspci_id_target == lspci_id_query, cell_id_target == cell_id_query) %>%
   arrange(desc(tau)) %>%
   group_by(lspci_id_query) %>%
   slice(1) %>%
@@ -208,8 +118,9 @@ ggsave(
   width = 3, height = 10
 )
 
+# Query using DGE, taking best matching target cell line
 cmap_match_cell_best_matching <- clue_res_dge %>%
-  filter(score_level == "cell") %>%
+  filter(score_level == "cell", result_type == "pert") %>%
   chuck("data", 1) %>%
   filter(lspci_id_target == lspci_id_query) %>%
   arrange(desc(tau)) %>%
@@ -226,7 +137,7 @@ ggsave(
 )
 
 cmap_match_cell_worst_matching <- clue_res_dge %>%
-  filter(score_level == "cell") %>%
+  filter(score_level == "cell", result_type == "pert") %>%
   chuck("data", 1) %>%
   filter(lspci_id_target == lspci_id_query) %>%
   arrange(tau) %>%
@@ -243,7 +154,7 @@ ggsave(
 )
 
 clue_match_best_vs_worst <- clue_res_dge %>%
-  filter(score_level == "cell") %>%
+  filter(score_level == "cell", result_type == "pert") %>%
   chuck("data", 1) %>%
   filter(lspci_id_target == lspci_id_query) %>%
   arrange(tau) %>%
@@ -254,22 +165,22 @@ clue_match_best_vs_worst <- clue_res_dge %>%
   mutate(match = factor(c("worst", "best"), levels = c("best", "worst", ""))) %>%
   ungroup() %>%
   ggplot(aes(match, tau, group = lspci_id_query)) +
-    geom_line() +
-    labs(x = "CMap cell line match", y = "Connectivity score") +
-    scale_x_discrete(drop = FALSE) +
-    geom_text_repel(
-      aes(label = pert_iname, x = "worst"),
-      data = ~.x %>%
-        filter(match == "worst"),
-      nudge_x = 2,
-      hjust = 1,
-      segment.color = "gray50"
-    ) +
-    geom_point(
-      color = "red"
-    ) +
+  geom_line() +
+  labs(x = "CMap cell line match", y = "Connectivity score") +
+  scale_x_discrete(drop = FALSE) +
+  geom_text_repel(
+    aes(label = pert_iname, x = "worst"),
+    data = ~.x %>%
+      filter(match == "worst"),
+    nudge_x = 2,
+    hjust = 1,
+    segment.color = "gray50"
+  ) +
+  geom_point(
+    color = "red"
+  ) +
   labs(title = "Self-connectivity best and worst matching cell")
-  
+
 ggsave(
   file.path(wd, "clue_match_best_vs_worst.pdf"),
   clue_match_best_vs_worst,
@@ -284,27 +195,27 @@ ggsave(
 top_hit_plot <- function(df, label = "pert_iname") {
   label_q <- sym(label)
   ggplot(df, aes(x = 0, y = tau)) +
-  geom_text_repel(
-    aes(y = tau, label = !!label_q),
-    hjust = 1,
-    nudge_x = rep_len(nrow(df), 1),
-    nudge_y = df$tau_rescaled - df$tau,
-    force = 0,
-    segment.color = "gray50"
-  ) +
-  geom_point(
-    color = "red"
-  ) +
-  theme_minimal() +
-  theme(
-    panel.grid.major.x = element_blank(),
-    panel.grid.minor.x = element_blank(),
-    axis.ticks.x = element_blank(),
-    axis.text.x = element_blank(),
-    axis.title.x = element_blank()
-  ) +
-  coord_cartesian(xlim = c(0, 1)) +
-  labs(y = "CMap connectivity score")
+    geom_text_repel(
+      aes(y = tau, label = !!label_q),
+      hjust = 1,
+      nudge_x = rep_len(nrow(df), 1),
+      nudge_y = df$tau_rescaled - df$tau,
+      force = 0,
+      segment.color = "gray50"
+    ) +
+    geom_point(
+      color = "red"
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank()
+    ) +
+    coord_cartesian(xlim = c(0, 1)) +
+    labs(y = "CMap connectivity score")
 }
 
 find_draw_top_hits <- function(
@@ -333,32 +244,32 @@ find_draw_top_hits <- function(
 }
 
 palbo_plot <- clue_res_dge %>%
-  filter(score_level == "cell") %>%
+  filter(score_level == "cell", result_type == "pert") %>%
   chuck("data", 1) %>%
   find_draw_top_hits(
     n_top = 30,
     pert_type = "trt_cp",
-    lspci_id_query = filter(compound_name_map, name == "Palbociclib")$lspci_id,
+    lspci_id_query = filter(compound_name_map, name == "palbociclib")$lspci_id,
     plot_args = list(label = "pert_iname")
   )
 
 alvo_plot <- clue_res_dge %>%
-  filter(score_level == "cell") %>%
+  filter(score_level == "cell", result_type == "pert") %>%
   chuck("data", 1) %>%
   find_draw_top_hits(
     n_top = 30,
     pert_type = "trt_cp",
-    lspci_id_query = filter(compound_name_map, name == "Alvocidib")$lspci_id,
+    lspci_id_query = filter(compound_name_map, name == "alvocidib")$lspci_id,
     plot_args = list(label = "pert_iname")
   )
 
 alvo_plot_l1000 <- clue_res_l1000 %>%
-  filter(score_level == "cell") %>%
+  filter(score_level == "cell", result_type == "pert") %>%
   chuck("data", 1) %>%
   find_draw_top_hits(
     n_top = 30,
     pert_type = "trt_cp",
-    lspci_id_query = filter(compound_name_map, name == "Alvocidib")$lspci_id,
+    lspci_id_query = filter(compound_name_map, name == "alvocidib")$lspci_id,
     plot_args = list(label = "pert_iname")
   )
 
@@ -485,7 +396,7 @@ drugs_dge_not_cmap <- comp_res %>%
   select_if(negate(is.list))
 
 ribo_top_hits <- clue_res_dge %>%
-  filter(score_level == "cell") %>%
+  filter(score_level == "cell", result_type == "pert") %>%
   chuck("data", 1) %>%
   find_draw_top_hits(
     n_top = 30,
@@ -582,12 +493,12 @@ ensembl_hugo_map <- comp_res_by_conc %>%
   reduce(union) %>%
   genebabel::query_hgnc("ensembl_gene_id")
 
-calculate_dose_response_l1000 <- function(meta, signatures, z_threshold = 1.645, method = "spearman") {
+calculate_dose_response_l1000 <- function(meta, signatures, z_threshold = 1.645) {
   select_signatures <- signatures %>%
     select(pr_gene_id, one_of(meta[["sig_id"]])) %>%
     filter(
       select(., -pr_gene_id) %>%
-          mutate_all(~abs(.x) >= z_threshold) %>%
+        mutate_all(~abs(.x) >= z_threshold) %>%
         purrr::reduce(magrittr::or)
     )
   select_signatures %>%
@@ -595,9 +506,8 @@ calculate_dose_response_l1000 <- function(meta, signatures, z_threshold = 1.645,
     inner_join(
       select(meta, sig_id, pert_dose), by = "sig_id"
     ) %>%
-    group_by(pr_gene_id) %>%
-    summarize(test = list(suppressWarnings(cor.test(round(z_score, digits = 1), pert_dose, method = method)))) %>%
-    ungroup()
+    rename(change = z_score, drug_conc = pert_dose) %>%
+    group_nest(pr_gene_id)
 }
 
 calculate_dose_response_dge <- function(data, p_threshold = 0.05) {
@@ -613,19 +523,18 @@ calculate_dose_response_dge <- function(data, p_threshold = 0.05) {
       select(data, condition, drug_conc), by = "condition"
     ) %>%
     drop_na(log2FoldChange) %>%
-    group_by(ensembl_gene_id) %>%
-    summarize(test = list(suppressWarnings(cor.test(round(log2FoldChange, digits = 1), drug_conc, method = "spearman")))) %>%
-    ungroup()
+    rename(change = log2FoldChange) %>%
+    group_nest(ensembl_gene_id)
 }
 
-calculate_dose_response <- function(drug, cell, time, p_threshold = 0.05, method = "spearman") {
+calculate_dose_response <- function(drug, cell, time, p_threshold = 0.05, method = "spearman", round_digits = 1) {
   l1000 <- signature_meta %>%
     filter(lspci_id == drug, cell_id == cell, if (!is.null(time)) pert_time == time else TRUE) %>%
     select_if(negate(is.list)) %>%
-    calculate_dose_response_l1000(cmap_signatures_profiled, z_threshold = qnorm(1 - p_threshold), method = method) %>%
-    inner_join(select(cmap_gene_meta, pr_gene_id, symbol), by = "pr_gene_id")
+    calculate_dose_response_l1000(cmap_signatures_profiled, z_threshold = qnorm(1 - p_threshold)) %>%
+    inner_join(cmap_gene_meta %>% filter(pr_is_lm == 1) %>% select(pr_gene_id, symbol), by = "pr_gene_id")
   dge <- comp_res_by_conc %>%
-    filter(drug == drug, cells == cell, if (!is.null(time)) replace_na(time == !!time, TRUE) else TRUE) %>%
+    filter(lspci_id == !!drug, cells == cell, if (!is.null(time)) replace_na(time == !!time, TRUE) else TRUE) %>%
     calculate_dose_response_dge(p_threshold = p_threshold) %>%
     inner_join(select(ensembl_hugo_map, ensembl_gene_id, symbol), by = "ensembl_gene_id")
   list(
@@ -633,65 +542,162 @@ calculate_dose_response <- function(drug, cell, time, p_threshold = 0.05, method
     dge = dge
   ) %>%
     bind_rows(.id = "method") %>%
+    mutate(
+      test = map(
+        data,
+        ~suppressWarnings(cor.test(
+          if (round_digits > 0) round(.x[["change"]], digits = round_digits) else x[["change"]],
+          .x[["drug_conc"]], method = !!method
+        ))
+      )
+    ) %>%
     group_by(symbol) %>%
     filter(length(unique(method)) == 2, n() == 2) %>%
     ungroup() %>%
-    select(symbol, method, test)
+    select(symbol, method, test, data)
 }
+
+dose_response_pairwise <- function(df) {
+  df %>%
+    select(symbol, method, test) %>%
+    spread(method, test) %>%
+    mutate(
+      significance = select(., dge, l1000) %>%
+        mutate_all(map_lgl, ~.x[["p.value"]] < 0.05) %>%
+        {
+          case_when(
+            .[["dge"]] & .[["l1000"]] ~ "both",
+            .[["dge"]] ~ "dge_only",
+            .[["l1000"]] ~ "l1000_only",
+            TRUE ~ "neither"
+          )
+        }
+    ) %>%
+    mutate_at(vars(dge, l1000), map_dbl, "estimate")
+}
+
+dose_response_pairwise_fisher <- function(df) {
+  tab <- df %>%
+    select(dge, l1000) %>%
+    gather("method", "correlation") %>%
+    mutate_at(vars(correlation), ~if_else(abs(.x) > 0.25, "correlated", "uncorrelated")) %>%
+    table()
+  test <- fisher.test(tab, conf.int = TRUE,conf.level = .95)
+  list(tab, test)
+}
+
+dose_response_curve <- function(df) {
+  df %>%
+    ggplot(aes(drug_conc, change, color = method)) +
+    geom_point() +
+    geom_smooth(aes(fill = method, group = method)) +
+    scale_x_log10() +
+    labs(x = "Dose (uM)", y = "Expression change (z-score)")
+}
+
+dose_response_cor_and_curves <- function(df, seed = 42) {
+  set.seed(seed)
+  dose_cor_plot_data <- dose_response_pairwise(df) %>%
+    mutate(
+      pos = case_when(
+        dge < 0.25 & abs(l1000) < 0.25 ~ "left_middle",
+        dge < 0.25 & l1000 < 0.25 ~ "left_bottom",
+        dge > 0.25 & abs(l1000) < 0.25 ~ "right_middle",
+        dge > 0.25 & l1000 > 0.25 ~ "right_top",
+        TRUE ~ "no"
+      )
+    ) %>%
+    group_by(pos) %>%
+    mutate(
+      selected = if(unique(pos) == "no")
+        "no"
+      else
+        sample(c(rep_len("no", n() - 1), unique(pos)), n())
+    ) %>%
+    ungroup()
+  dose_fisher <- dose_response_pairwise_fisher(dose_cor_plot_data)
+  cor_plot <- dose_cor_plot_data %>%
+    mutate(
+      color_selected = if_else(selected == "no", "black", "red") %>%
+        factor(levels = c("black", "red"))
+    ) %>%
+    arrange(color_selected) %>%
+    ggplot(aes(dge, l1000, color = color_selected)) +
+    geom_hline(yintercept = c(-0.25, 0.25), color = "grey30") +
+    geom_vline(xintercept = c(-0.25, 0.25), color = "grey30") +
+    geom_point(alpha = 0.8) +
+    coord_equal(xlim = c(-1, 1), ylim = c(-1, 1)) +
+    scale_color_identity() +
+    guides(color = FALSE) +
+    labs()
+  dose_plots <- df %>%
+    inner_join(
+      dose_cor_plot_data %>%
+        filter(selected != "no"),
+      by = "symbol"
+    ) %>%
+    select(symbol, pos, method, data) %>%
+    unnest(data) %>%
+    group_nest(symbol, pos) %>%
+    mutate(
+      plot = map(data, dose_response_curve) %>%
+        map2(symbol, ~.x + labs(title = .y))
+    ) %>%
+    {set_names(.[["plot"]], .[["pos"]])}
+  arrangeGrob(
+    grobs = list(
+      cor_plot,
+      dose_plots[["left_middle"]],
+      dose_plots[["left_bottom"]],
+      dose_plots[["right_middle"]],
+      dose_plots[["right_top"]]
+    ),
+    layout_matrix = rbind(
+      c(2, 1, 5),
+      c(3, 1, 4)
+    ),
+    widths = unit(c(3, 4, 3), "in"),
+    heights = unit(c(2, 2), "in")
+  )
+}
+
 
 palbo_dose_cor <- calculate_dose_response(
   filter(compound_name_map, name == "palbociclib")$lspci_id,
   "MCF7", time = 24
 )
-  signature_meta %>%
-  filter(pert_iname == "palbociclib", cell_id == "MCF7", pert_time == 24) %>%
-  select_if(negate(is.list)) %>%
-  calculate_dose_response_l1000(cmap_signatures_profiled, z_threshold = 2) %>%
-  inner_join(select(cmap_gene_meta, pr_gene_id, symbol), by = "pr_gene_id")
 
+x <- dose_response_cor_and_curves(palbo_dose_cor, seed = 1)
 
-palbo_dose_cor_dge <- comp_res_by_conc %>%
-  filter(drug == "Palbociclib", cells == "MCF7") %>%
-  calculate_dose_response_dge(p_threshold = 0.05) %>%
-  inner_join(select(ensembl_hugo_map, ensembl_gene_id, symbol), by = "ensembl_gene_id")
+palbo_dose_cor_plot_data <- dose_response_pairwise(palbo_dose_cor)
 
-palbo_dose_cor <- list(
-  l1000 = palbo_dose_cor_l1000,
-  dge = palbo_dose_cor_dge
-) %>%
-  bind_rows(.id = "method") %>%
-  group_by(symbol) %>%
-  filter(length(unique(method)) == 2, n() == 2) %>%
-  ungroup() %>%
-  select(symbol, method, test) %>%
-  spread(method, test) %>%
-  mutate(
-    significance = select(., dge, l1000) %>%
-      mutate_all(map_lgl, ~.x[["p.value"]] < 0.05) %>%
-      {
-        case_when(
-          .[["dge"]] & .[["l1000"]] ~ "both",
-          .[["dge"]] ~ "dge_only",
-          .[["l1000"]] ~ "l1000_only",
-          TRUE ~ "neither"
-        )
-      }
-  ) %>%
-  mutate_at(vars(dge, l1000), map_dbl, "estimate")
+palbo_dose_fisher <- dose_response_pairwise_fisher(palbo_dose_cor_plot_data)
 
-palbo_dose_cor_plot <- palbo_dose_cor %>%
+palbo_dose_cor_plot <- palbo_dose_cor_plot_data %>%
   ggplot(aes(dge, l1000)) +
-    geom_hline(yintercept = c(-0.25, 0.25), color = "grey30") +
-    geom_vline(xintercept = c(-.25, .25), color = "grey30") +
-    geom_point() +
-    coord_equal(xlim = c(-1, 1), ylim = c(-1, 1)) +
-    labs(title = "Palbociclib dose-response correlation per gene")
+  geom_hline(yintercept = c(-0.25, 0.25), color = "grey30") +
+  geom_vline(xintercept = c(-0.25, 0.25), color = "grey30") +
+  geom_point(alpha = 0.8) +
+  coord_equal(xlim = c(-1, 1), ylim = c(-1, 1)) +
+  labs(title = "Palbociclib dose-response correlation per gene")
 
 ggsave(
-  file.path(wd, "palbo_dose_cor_plot.pdf"),
+  file.path(wd, "palbo_dose_cor_plot_significance.pdf"),
   palbo_dose_cor_plot,
   width = 6, height = 5
 )
-```
 
+
+palbo_dose_srsf3 <- palbo_dose_cor %>%
+  select(symbol, method, data) %>%
+  filter(symbol == "SRSF3") %>%
+  unnest(data) %>%
+  dose_response_curve()
+
+ggsave(
+  file.path(wd, "palbo_dose_srsf3.pdf"),
+  palbo_dose_srsf3,
+  width = 6, height = 4
+)
+```
 

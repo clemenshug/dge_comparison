@@ -1,0 +1,178 @@
+---
+title: "Clue connectivity analysis"
+author: "Clemens Hug"
+date: "2/6/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(synExtra)
+library(tidyverse)
+library(cmapR)
+library(here)
+library(egg)
+library(broom)
+library(ggrepel)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("data")
+
+wd <- here("clue_query")
+dir.create(wd, showWarnings = FALSE)
+
+theme_set(theme_bw())
+```
+
+
+```{r load}
+clue_res <- syn("syn21646960") %>%
+  read_rds()
+
+pertubation_meta <- syn("syn21547097") %>%
+  read_csv()
+
+diff_exp_by_conc <- syn("syn21559856") %>%
+  read_rds()
+
+compound_dict <- syn("syn21094266") %>%
+  read_csv()
+
+```
+
+
+```{r wrangle_clue_results}
+diff_exp_by_conc <- diff_exp_by_conc %>%
+  mutate(
+    # Create same unique identifier for diff expression datasets
+    # that was used for Clue query
+    gene_set = paste(dataset, drug, cells, drug, stim, stim_conc, time, sep = "_") %>%
+      str_replace_all("\\s", "_") %>%
+      str_replace_all("[^\\w]", "")
+  )
+
+
+annotate_clue_res <- function(data, result_type, score_level, source, ...) {
+  data_out <- data
+
+  # Standardize cell line names of 
+  if ("cell_id" %in% colnames(data))
+    data_out <- mutate_at(data_out, vars(cell_id), str_to_lower) %>%
+      rename(cell_id_target = cell_id)
+  
+  data_out <- if (source == "dge") {
+    # Add metadata from the DGE differential expression
+    inner_join(
+      data_out,
+      diff_exp_by_conc %>%
+        distinct(gene_set, dataset_query = dataset, cell_id_query = str_to_lower(cells), lspci_id_query = lspci_id),
+      by = "gene_set"
+    )
+  } else {
+    # Metadata for L1000 queries is just the drug id
+    # since all cell types where merged for query
+    mutate(
+      data_out,
+      lspci_id_query = as.numeric(str_sub(gene_set, 2L))
+    )
+  } %>%
+    inner_join(
+      compound_dict %>%
+        transmute(lspci_id, name_query = str_to_lower(pref_name)),
+      by = c("lspci_id_query" = "lspci_id")
+    )
+  
+  if (result_type == "pert") {
+    # Add metadata for the matches in CMap (targets)
+    data_out <- inner_join(
+      data_out,
+      pertubation_meta %>%
+        distinct(pert_id, lspci_id_target = lspci_id),
+      by = c("pert_id")
+    )
+  } else if (result_type == "pcl") {
+    # Add metadata for the groups of drugs in CMap
+    data_out <- data_out %>%
+      mutate(
+        pert_id = id
+      ) %>%
+      separate(pert_id, into = c("pert_id", "cell_id_target"), sep = ":", fill = "right") %>%
+      mutate(
+        cell_id_target = as.character(cell_id_target) %>%
+          str_to_lower()
+      )
+  }
+  
+  data_out
+}
+
+clue_res_both <- clue_res %>%
+  mutate(
+    # Separate Clue queries by gene set source (DGE and L1000)
+    data = map(
+      data,
+      group_nest,
+      source = if_else(str_starts(gene_set, fixed("X")), "l1000", "dge"),
+      keep = TRUE
+    )
+  ) %>%
+  unnest(data) %>%
+  mutate(
+    data = pmap(
+      .,
+      annotate_clue_res
+    )
+  )
+
+clue_res_dge <- clue_res_both %>%
+  filter(source == "dge")
+
+clue_res_l1000 <- clue_res_both %>%
+  filter(source == "l1000")
+
+clue_res_both <- clue_res_both %>%
+  group_by_at(vars(-source, -data)) %>%
+  summarize(data = list(bind_rows(data))) %>%
+  ungroup()
+
+write_rds(
+  clue_res_dge,
+  file.path(wd, "clue_results_dge.rds"),
+  compress = "gz"
+)
+write_rds(
+  clue_res_l1000,
+  file.path(wd, "clue_results_l1000.rds"),
+  compress = "gz"
+)
+write_rds(
+  clue_res_both,
+  file.path(wd, "clue_results_combined.rds"),
+  compress = "gz"
+)
+
+```
+
+
+```{r upload_synapse}
+activity <- synapser::Activity(
+  name = "Wrangle Clue query results",
+  used = c(
+    "syn21646960",
+    "syn21547097",
+    "syn21559856",
+    "syn21094266"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/09_query_clue_wrangling.Rmd"
+)
+
+c(
+  file.path(wd, "clue_results_dge.rds"),
+  file.path(wd, "clue_results_l1000.rds"),
+  file.path(wd, "clue_results_combined.rds")
+) %>%
+  synStoreMany(parentId = "syn21547022", activity = activity)
+```
+
+
+
+
