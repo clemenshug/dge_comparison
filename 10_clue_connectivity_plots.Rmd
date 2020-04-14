@@ -25,7 +25,8 @@ theme_set(theme_bw())
 
 
 ```{r load}
-compound_name_map <- syn("syn21586544") %>%
+compound_name_map <- synapser::synGet("syn21586544", version = 1) %>%
+  chuck("path") %>%
   read_csv() %>%
   distinct(
     lspci_id,
@@ -46,6 +47,15 @@ clue_res_l1000 <- syn("syn21907143") %>%
 
 clue_res_combined <- syn("syn21907166") %>%
   read_rds()
+
+diff_exp_by_conc <- syn("syn21559856") %>%
+  read_rds()
+
+pertubation_meta <- syn("syn21547097") %>%
+  read_csv()
+
+signature_meta <- syn("syn21547101") %>%
+  read_csv()
 
 ```
 
@@ -342,7 +352,7 @@ find_draw_top_hit_comps <- function(
     labs(title = paste0("Top ", n_top, " hits"))
 }
 
-top_hits_both_alvocidib <- clue_res_both %>%
+top_hits_both_alvocidib <- clue_res_combined %>%
   filter(score_level == "cell", result_type == "pert") %>%
   chuck("data", 1) %>%
   find_draw_top_hit_comps(
@@ -352,7 +362,7 @@ top_hits_both_alvocidib <- clue_res_both %>%
   ) +
   labs(title = "Top 20 hits for Alvocidib")
 
-top_hits_both_alvocidib <- clue_res_both %>%
+top_hits_both_alvocidib <- clue_res_combined %>%
   filter(score_level == "cell", result_type == "pert") %>%
   chuck("data", 1) %>%
   filter(lspci_id_query == 21311, lspci_id_target == 21311)
@@ -364,7 +374,7 @@ ggsave(
   width = 5, height = 10
 )
 
-top_hits_both_alvocidib_pcl <- clue_res_both %>%
+top_hits_both_alvocidib_pcl <- clue_res_combined %>%
   filter(score_level == "cell", result_type == "pcl") %>%
   chuck("data", 1) %>%
   find_draw_top_hit_comps(
@@ -385,13 +395,13 @@ ggsave(
 
 
 ```{r drugs_not_cmap}
-drugs_dge <- comp_res %>%
+drugs_dge <- diff_exp_by_conc %>%
   pull(lspci_id) %>%
   unique()
 
 pertubation_meta
 
-drugs_dge_not_cmap <- comp_res %>%
+drugs_dge_not_cmap <- diff_exp_by_conc %>%
   filter(lspci_id %in% drugs_dge[!drugs_dge %in% pertubation_meta$lspci_id]) %>%
   select_if(negate(is.list))
 
@@ -487,7 +497,7 @@ ggsave(
 
 ```{r dose_response}
 
-ensembl_hugo_map <- comp_res_by_conc %>%
+ensembl_hugo_map <- diff_exp_by_conc %>%
   pull("result") %>%
   map("ensembl_gene_id") %>%
   reduce(union) %>%
@@ -533,7 +543,7 @@ calculate_dose_response <- function(drug, cell, time, p_threshold = 0.05, method
     select_if(negate(is.list)) %>%
     calculate_dose_response_l1000(cmap_signatures_profiled, z_threshold = qnorm(1 - p_threshold)) %>%
     inner_join(cmap_gene_meta %>% filter(pr_is_lm == 1) %>% select(pr_gene_id, symbol), by = "pr_gene_id")
-  dge <- comp_res_by_conc %>%
+  dge <- diff_exp_by_conc %>%
     filter(lspci_id == !!drug, cells == cell, if (!is.null(time)) replace_na(time == !!time, TRUE) else TRUE) %>%
     calculate_dose_response_dge(p_threshold = p_threshold) %>%
     inner_join(select(ensembl_hugo_map, ensembl_gene_id, symbol), by = "ensembl_gene_id")
@@ -667,7 +677,9 @@ palbo_dose_cor <- calculate_dose_response(
   "MCF7", time = 24
 )
 
-x <- dose_response_cor_and_curves(palbo_dose_cor, seed = 1)
+palbo_dose_cor_plot <- dose_response_cor_and_curves(palbo_dose_cor, seed = 1)
+
+grid::grid.draw(palbo_dose_cor_plot)
 
 palbo_dose_cor_plot_data <- dose_response_pairwise(palbo_dose_cor)
 
