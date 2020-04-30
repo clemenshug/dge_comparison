@@ -66,6 +66,12 @@ prepare_counts <- function(mtx, col_meta, row_meta, gene_mapping) {
     )
 }
 
+norm_drug <- function(x) {
+  x %>%
+    str_to_lower() %>%
+    str_replace_all("[^a-zA-Z0-9]", "")
+}
+
 ```
 
 ## John Santa Maria Merck drugs
@@ -103,7 +109,14 @@ jsm_meta <- jsm_meta_raw %>%
     cells = Cells,
     stim = recode(Stim, "0" = "control"),
     stim_conc = `StimConc(inng/mL)`,
-    drug = recode(Drug, "0" = "control"),
+    # Misspelled drug
+    drug = recode(
+      Drug,
+      "0" = "control",
+      "5Z-7-Oxozeanol" = "5Z-7-Oxozeaenol",
+      "Nec-1s" = "CHEMBL381230",
+      
+    ),
     drug_conc = `DrugConc(inuM)`
   )
 
@@ -154,7 +167,11 @@ ld_dub_meta <- ld_dub_raw %>%
     plate = 1,
     well,
     cells = cellline,
-    drug = recode(agent, "DMSO" = "control"),
+    drug = recode(
+      agent,
+      "DMSO" = "control",
+      "CGM097" = "CHEMBL3601398"
+    ),
     drug_conc = concentration,
     time
   )
@@ -170,7 +187,7 @@ sr_repurposing_meta_raw1 <- synapser::synGet("syn21546999", followLink = TRUE) %
 sr_repurposing_meta_raw2 <- synapser::synGet("syn21547000", followLink = TRUE) %>%
   chuck("path") %>%
   read_csv()
-
+  
 sr_repurposing_meta1 <- sr_repurposing_meta_raw1 %>%
   transmute(
     plate = 1,
@@ -187,8 +204,18 @@ sr_repurposing_meta2 <- sr_repurposing_meta_raw2 %>%
     well = Well,
     cells = "rencell",
     drug = recode(Drug, "DMSO" = "control"),
+    stim = str_match(drug, "\\((.+)\\)$") %>%
+      {.[, 2]} %>%
+      str_trim(),
     drug_conc = Concentration %>%
       magrittr::inset(is.na(.), 0)
+  ) %>%
+  mutate(
+    stim = if_else(drug %in% stim, drug, stim),
+    drug = str_replace_all(drug, "\\(.+\\)$", "") %>%
+      str_trim() %>%
+      # If drug is actually a stimulus put control
+      {if_else(. == stim & !is.na(stim), "control", .)}
   )
 
 ```
@@ -196,7 +223,7 @@ sr_repurposing_meta2 <- sr_repurposing_meta_raw2 %>%
 
 ```{r counts}
 dataset_syn <- tribble(
-  ~dataset, ~folder_syn, ~batch,
+  ~dataset, ~folder_syn, ~date,
   "jsm_merck", "syn21541313", "2017_09",
   "lincs_cdk4_6_7", "syn21541462", "2017_09",
   "ld_dub", "syn21541471", "2018_06",
@@ -238,7 +265,7 @@ dataset_syn <- tribble(
   unnest(files)
 
 dataset_files <- dataset_syn %>%
-  mutate_at(vars(-dataset, -folder_syn, -batch), map_chr, syn)
+  mutate_at(vars(-dataset, -folder_syn, -date), map_chr, syn)
 
 datasets_raw <- dataset_files %>%
   mutate_at(
@@ -293,29 +320,34 @@ ensembl_gene_id_mapping_biomart <- biomaRt::select(
   slice(1) %>%
   ungroup()
 
-datasets_well <- datasets_raw %>%
+# There are some spurios barcodes that don't map to any well
+# get rid of them with drop_na
+datasets_counts <- datasets_raw %>%
   transmute(
     dataset,
     plate,
-    batch,
+    date,
     counts = pmap(
       list(counts, colnames, rownames),
       prepare_counts,
       ensembl_gene_id_mapping_biomart
-    ),
+    ) %>%
+      map(drop_na, well),
     count_dupes = pmap(
       list(count_dupes, colnames, rownames),
       prepare_counts,
       ensembl_gene_id_mapping_biomart
-    ),
-    barcode_counts
+    ) %>%
+      map(drop_na, well),
+    barcode_counts = barcode_counts %>%
+      map(drop_na, well)
   )
 ```
 
 
 ```{r datasets_with_meta}
 meta_all <- tribble(
-  ~dataset, ~meta, ~batch,
+  ~dataset, ~meta, ~date,
   "jsm_merck", jsm_meta, "2017_09",
   "lincs_cdk4_6_7", cdk_old_meta, "2017_09",
   "ld_dub", ld_dub_meta, "2018_06",
@@ -323,85 +355,80 @@ meta_all <- tribble(
   "sr_repurposing", sr_repurposing_meta1, "2018_02",
   "sr_repurposing", sr_repurposing_meta2, "2018_11",
 ) %>%
-  mutate(
-    meta = map2(
-      meta, dataset,
-      ~.x %>%
-        mutate(
-          condition = do.call(
-            paste,
-            as.list(.x)[c("cells", "stim", "stim_conc", "drug", "drug_conc", "time")] %>%
-              magrittr::inset2("sep", "_")
-          ),
-          sample_id = paste(.y, plate, well, condition, sep = "_"),
-          control_condition = do.call(
-            paste,
-            as.list(.x)[c("cells", "stim", "stim_conc", "drug", "drug_conc", "time")] %>%
-              magrittr::inset2("drug", "control") %>%
-              magrittr::inset2("drug_conc", 0) %>%
-              magrittr::inset2("sep", "_")
-          ) %>%
-            magrittr::inset(!(. %in% condition), NA_character_)
-        )
-    )
-  ) %>%
   unnest(meta) %>%
-  group_nest(dataset, plate, .key = "meta") %>%
-  mutate(plate = if_else(is.na(plate), "1", as.character(plate)))
+  mutate(
+    drug_norm = norm_drug(drug),
+    plate = if_else(is.na(plate), "1", as.character(plate)),
+    batch = paste(dataset, date, plate, sep = "_"),
+  )
 
 cmpd_name_map <- syn("syn21586544") %>%
-  read_csv()
-
-cmpd_dict <- syn("syn21094266") %>%
   read_csv()
 
 cmpd_name_map_norm <- cmpd_name_map %>%
   distinct(
     lspci_id,
-    name = str_to_lower(name) %>%
-      str_replace_all("[^a-zA-Z0-9]", "")
-  )
+    name,
+    name_norm = norm_drug(name)
+  ) %>%
+  # Barasertib appears twice in Chembl (CHEMBL415049 and CHEMBL215152)
+  # CHEMBL215152 is most likely a mistake
+  # keeping only CHEMBL415049 (lspci_id 102882), discarding CHEMBL215152 (lspci_id 100354)
+  filter(lspci_id != 100354)
 
 cmdps_mapped <- meta_all %>%
-  unnest(meta) %>%
   distinct(
-    drug_norm = str_to_lower(drug) %>%
-      str_replace_all("[^a-zA-Z0-9]", "")
+    drug,
+    drug_norm
   ) %>%
   left_join(
     cmpd_name_map_norm,
-    by = c("drug_norm" = "name")
-  ) %>%
-  filter(lspci_id != 78695)
-
-# Barasertib appears twice in Chembl (CHEMBL415049 and CHEMBL215152)
-# CHEMBL215152 is most likely a mistake
-# keeping only CHEMBL415049 (lspci_id 50430), discarding CHEMBL215152 (lspci_id 78695)
+    by = c("drug_norm" = "name_norm")
+  )
 
 meta_cmpd_mapped <- meta_all %>%
-  unnest(meta) %>%
-  mutate(
-    drug_norm = str_to_lower(drug) %>%
-      str_replace_all("[^a-zA-Z0-9]", "")
-  ) %>%
   left_join(
-    cmdps_mapped,
+    distinct(cmdps_mapped, drug_norm, lspci_id),
     by = "drug_norm"
   ) %>%
-  group_nest(dataset, plate, batch, .key = "meta")
+  mutate(
+    # drug_id is either lspci_id or normalized drug name, if lspci_id was not found
+    drug_id = if_else(!is.na(lspci_id), as.character(lspci_id), drug_norm)
+  ) %>%
+  mutate(
+    condition = exec(
+      paste,
+      !!!as.list(.)[c("cells", "stim", "stim_conc", "drug_id", "drug_conc", "time")],
+      sep = "_"
+    ),
+    sample_id = paste(batch, well, condition, sep = "_"),
+    # Matching each sample with it's control condition
+    # This is the sample which has the same cell line, stimulus and time point
+    # and drug == "control"
+    control_condition = exec(
+      paste,
+      !!!as.list(.)[c("cells", "stim", "stim_conc", "drug_id", "drug_conc", "time")] %>%
+        magrittr::inset2("drug_id", "control") %>%
+        magrittr::inset2("drug_conc", 0) %>%
+        magrittr::inset2("sep", "_")
+    ) %>%
+      magrittr::inset(!(. %in% condition), NA_character_)
+  ) %>%
+  group_nest(dataset, date, plate, batch, .key = "meta")
 
-datasets <- datasets_well %>%
-  inner_join(meta_cmpd_mapped, by = c("dataset", "plate", "batch")) %>%
+datasets <- datasets_counts %>%
+  inner_join(meta_cmpd_mapped , by = c("dataset", "date", "plate")) %>%
   mutate_at(
     vars(counts, count_dupes, barcode_counts),
     map2,
     .$meta,
     ~.x %>%
-      left_join(
-        select(.y, well, sample_id),
+      inner_join(
+        distinct(.y, well, sample_id),
         by = "well"
       )
-  )
+  ) %>%
+  select(-meta)
 
 
 write_rds(
@@ -410,8 +437,14 @@ write_rds(
   compress = "gz"
 )
 
+write_rds(
+  meta_cmpd_mapped,
+  file.path(wd, "meta_mapped.rds"),
+  compress = "gz"
+)
+
 dataset_names <- tribble(
-  ~dataset, ~dataset_name, ~batch,
+  ~dataset, ~dataset_name, ~date,
   "jsm_merck", "2017_09_john_santa_maria_merck_drugs", "2017_09",
   "lincs_cdk4_6_7", "2017_09_lincs_cdk4_6_inhibitors", "2017_09",
   "ld_dub", "2018_06_laura_doherty_dub_inhibitors", "2018_06",
@@ -442,9 +475,8 @@ activity <- synapser::Activity(
     "syn21542403",
     "syn21542711",
     "syn21586544",
-    "syn21094266",
     dataset_syn %>%
-      select(-dataset, -folder_syn, -plate, -batch) %>%
+      select(-dataset, -folder_syn, -plate, -date) %>%
       reduce(union)
   ),
   executed = "https://github.com/clemenshug/dge_comparison/blob/master/wrangling/09_dge_datasets.Rmd"
@@ -452,7 +484,8 @@ activity <- synapser::Activity(
 
 c(
   file.path(wd, "counts_raw.rds"),
-  file.path(wd, "dataset_names.csv")
+  file.path(wd, "dataset_names.csv"),
+  file.path(wd, "meta_mapped.rds")
 ) %>%
   synStoreMany(parentId = "syn21542764", activity = activity)
 
