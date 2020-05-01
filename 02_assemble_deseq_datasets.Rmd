@@ -2,7 +2,6 @@
 ```{r loading, echo=FALSE}
 library(synExtra)
 library(tidyverse)
-library(biomaRt)
 library(here)
 library(furrr)
 # library(synapser)
@@ -20,6 +19,9 @@ dir.create(wd, showWarnings = FALSE)
 
 ```{r read_data}
 counts_raw <- syn("syn21544261") %>%
+  read_rds()
+
+meta <- syn("syn22000707") %>%
   read_rds()
 
 ```
@@ -43,8 +45,10 @@ Using DESeq2 to normalize contact counts. Normalizing each batch separately.
 ```{r deseq_normalization}
 
 samples_passing <- counts_raw %>%
+  inner_join(meta, by = c("dataset", "date", "plate", "batch")) %>%
   transmute(
     dataset,
+    date,
     plate,
     batch,
     meta = map2(
@@ -76,10 +80,11 @@ data_sets_deseq <- samples_passing %>%
   mutate(
     counts_deseq = pmap(
       .,
-      function(meta_deseq, counts, ...) {
+      function(meta_deseq, counts, batch, ...) {
         # browser()
+        message(batch)
         counts %>%
-          dplyr::select(ensembl_gene_id, sample_id, count) %>%
+          select(ensembl_gene_id, sample_id, count) %>%
           filter(sample_id %in% rownames(meta_deseq)) %>%
           spread(sample_id, count) %>%
           mutate_at(vars(-ensembl_gene_id), replace_na, replace = 0) %>%
@@ -90,7 +95,8 @@ data_sets_deseq <- samples_passing %>%
   )
 
 write_rds(
-  data_sets_deseq,
+  data_sets_deseq %>%
+    select(-counts, -meta),
   here("deseq", "deseq_input.rds"),
   compress = "gz"
 )
@@ -102,7 +108,8 @@ write_rds(
 activity <- synapser::Activity(
   name = "Wrangle DGE data",
   used = c(
-    "syn21544261"
+    "syn21544261",
+    "syn22000707"
   ),
   executed = "https://github.com/clemenshug/dge_comparison/blob/master/02_assemble_deseq_datasets.Rmd"
 )
