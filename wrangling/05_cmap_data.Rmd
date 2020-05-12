@@ -20,8 +20,21 @@ syn <- synExtra::synDownloader("~/data/DGE_comp/")
 
 
 ```{r compound_info}
-compound_dict <- syn("syn21094266") %>%
-  read_csv()
+compound_dict <- syn("syn20835543") %>%
+  read_rds()
+
+fingerprints <- syn("syn21042105") %>%
+  read_rds()
+
+# Using previously done pertubation meta and signature meta
+# pm <- syn("syn21547097") %>%
+#   read_csv()
+# 
+# im <- syn("syn21547100") %>%
+#   read_csv()
+# 
+# sm <- syn("syn21547101") %>%
+#   read_csv()
 
 ```
 
@@ -53,11 +66,13 @@ unique_compounds <- pertubation_meta_raw %>%
     by = "pert_id"
   )
 
-plan(multisession(workers = 4))
+
+
+plan(multisession(workers = 8))
 unique_compounds_canonical <- unique_compounds %>%
   distinct(pert_id, inchi) %>%
   drop_na() %>%
-  chunk_df(12) %>%
+  chunk_df(16) %>%
   future_map(
     ~left_join(
       .x,
@@ -72,48 +87,117 @@ unique_compounds_canonical <- unique_compounds %>%
   ) %>%
   bind_rows()
 
-compound_dict_chunks <- compound_dict %>%
-  drop_na(inchi) %>%
-  select(lspci_id, inchi) %>%
-  chunk_df(10) %>%
-  enframe("chunk_id", "data")
+write_rds(
+  unique_compounds_canonical,
+  here("wrangled", "cmap_compounds_canonical.rds"),
+  compress = "gz"
+)
 
-compound_lspci_id_mapping <- compound_dict_chunks %>%
-  crossing(fingerprint_type = c("morgan", "topological")) %>%
+# unique_compounds_canonical <- read_rds(
+#   here("wrangled", "cmap_compounds_canonical.rds")
+# )
+
+
+unique_compounds_fingerprints <- unique_compounds_canonical %>%
+  drop_na(canonical_inchi) %>%
+  crossing(
+    fingerprint_type = c("morgan", "topological")
+  ) %>%
+  group_nest(fingerprint_type) %>%
   mutate(
-    data = future_map2(
+    data = map2(
       data, fingerprint_type,
-      ~chemical_similarity_threshold(
-        unique_compounds_canonical %>%
-          drop_na(canonical_inchi) %>%
-          distinct(pert_id, canonical_inchi) %>%
-          {set_names(.$canonical_inchi, .$pert_id)},
-        .x %>%
-          {set_names(.$inchi, .$lspci_id)},
-          # head(100000),
-        threshold = 1,
-        fingerprint_type = .y,
-        url = "http://192.168.56.101:8000"
-      ),
-      .progress = TRUE
+      function(df, fpt) {
+        q <- set_names(df[["canonical_inchi"]], df[["pert_id"]])
+        attr(q, "identifier") <- "inchi"
+        lspcheminf::calculate_fingerprints(q, fpt)
+      }
     )
   )
 
-# compound_dict_mw <- compound_dict_chunks %>%
-#  mutate(
-#    mw = future_map(
-#      data,
-#      ~lspcheminf::molecular_mass(
-#        set_names(.x$inchi, .x$lspci_id)
-#      ),
-#      .progress = TRUE
-#    )
-#  )
+write_rds(
+  unique_compounds_fingerprints,
+  here("wrangled", "cmap_compound_fingerprints.rds"),
+  compress = "gz"
+)
 
+# unique_compounds_fingerprints <- read_rds(
+#   here("wrangled", "cmap_compound_fingerprints.rds")
+# )
+
+lsp_fp <- fingerprints %>%
+  filter(fp_name == "morgan_normal") %>%
+  chuck("data", 1) %>%
+  filter(fp_name != "morgan_chiral") %>%
+  group_nest(fingerprint_type = fp_type, .key = "reference")
+
+compound_lspci_id_mapping <- unique_compounds_fingerprints %>%
+  left_join(
+    lsp_fp, by = "fingerprint_type"
+  ) %>%
+  mutate(
+    data = map2(
+      data, reference,
+      function(d, r) {
+        dq <- set_names(d[["fingerprints"]], d[["names"]])
+        rq <- set_names(r[["fingerprint"]], as.character(r[["lspci_id"]]))
+        # browser()
+        lspcheminf::chemical_similarity_threshold(
+          dq, rq, precalculated = TRUE, threshold = 0.99999,
+          n_threads = 10
+        )
+      }
+    )
+  )
+
+compound_dict_chunks <- compound_dict %>%
+  filter(fp_name == "morgan_normal") %>%
+  chuck("data", 1) %>%
+  drop_na(inchi) %>%
+  select(lspci_id, inchi) %>%
+  chunk_df(16)
+
+compound_dict_mw <- compound_dict_chunks %>%
+  future_map(
+    ~lspcheminf::molecular_mass(
+      set_names(.x$inchi, .x$lspci_id),
+      url = "http://127.0.0.1:8001"
+    ),
+    .progress = TRUE
+  )
+
+compound_dict_mw_df <- compound_dict_mw %>%
+  bind_rows() %>%
+  transmute(
+    lspci_id = as.integer(compound),
+    mass
+  )
+
+write_rds(
+  compound_dict_mw_df,
+  here("wrangled", "compound_dict_mw.rds"),
+  compress = "gz"
+)
+
+cmap_mw <- unique_compounds_canonical %>%
+  drop_na(canonical_inchi) %>%
+  {set_names(.[["canonical_inchi"]], .[["pert_id"]])} %>%
+  lspcheminf::molecular_mass(url = "http://127.0.0.1:8001")
 
 compound_lspci_id_mapping_df <- compound_lspci_id_mapping %>%
   select(data, fingerprint_type) %>%
   unnest(data) %>%
+  mutate_at(vars(target), as.integer) %>%
+  left_join(
+    select(compound_dict_mw_df, lspci_id, mass_lspci_id = mass),
+    by = c("target" = "lspci_id")
+  ) %>%
+  left_join(
+    select(cmap_mw, pert_id = compound, mass_pert_id = mass),
+    by = c("query" = "pert_id")
+  ) %>%
+  # Remove matches with unqual mass
+  filter(near(mass_lspci_id, mass_pert_id)) %>%
   group_by(query) %>%
   filter(
     n() == 2,
@@ -167,7 +251,7 @@ instance_meta_raw <- list(
   bind_rows(.id = "dataset")
 
 instance_meta <- instance_meta_raw %>%
-  left_join(select(pertubation_meta, pert_id, pubchem_cid, lspci_id), by = "pert_id")
+  left_join(distinct(pertubation_meta, pert_id, pubchem_cid, lspci_id), by = "pert_id")
 
 write_csv(instance_meta, file.path("..", "wrangled", "cmap_instance_meta.csv.gz"))
 ```
@@ -193,7 +277,7 @@ signature_meta <- signature_meta_raw %>%
     pert_time = if_else(is.na(pert_time), as.double(str_match(pert_itime, "([\\d]+) h")[, 2]), pert_time),
     pert_time_unit = if_else(is.na(pert_itime), NA_character_, "h")
   ) %>%
-  left_join(select(pertubation_meta, pert_id, lspci_id), by = "pert_id")
+  left_join(distinct(pertubation_meta, pert_id, lspci_id), by = "pert_id")
 
 write_csv(signature_meta, file.path("..", "wrangled", "cmap_signature_meta.csv.gz"))
 ```
