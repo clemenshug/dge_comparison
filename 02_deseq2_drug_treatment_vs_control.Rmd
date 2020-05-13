@@ -50,7 +50,7 @@ match_samples <- function(meta) {
     group_nest(control_condition, .key = "controls")
   samples %>%
     left_join(controls, by = "control_condition") %>%
-    filter(map2_lgl(samples, controls, ~nrow(.x) > MIN_N & nrow(.y) > MIN_N)) %>%
+    filter(map2_lgl(samples, controls, ~nrow(.x) >= MIN_N & nrow(.y) >= MIN_N)) %>%
     mutate(
       meta_deseq = map2(
         samples, controls,
@@ -66,23 +66,18 @@ match_samples <- function(meta) {
     # Use normalized drug_id instead
     left_join(
       meta %>%
-        distinct(condition, cell, drug_id, lspci_id, drug_conc, stim, stim_conc),
+        distinct(condition, cells, drug_id, lspci_id, drug_conc, stim, stim_conc),
       by = "condition"
     )
 }
 
 comps_meta <- deseq_input %>%
   transmute(
-    dataset,
     batch,
     meta = map(meta_deseq, rownames_to_column, "sample_id")
   ) %>%
   unnest(meta) %>%
-  group_nest(dataset, .key = "meta") %>%
-  transmute(
-    dataset,
-    samples = map(meta, match_samples)
-  )
+  match_samples()
 
 ```
 
@@ -92,39 +87,37 @@ comps_meta <- deseq_input %>%
 
 
 ```{r deseq_drugs_vs_control}
-dataset_counts <- deseq_input %>%
-  select(dataset, counts) %>%
-  group_by(dataset) %>%
-  summarize(counts = list(bind_rows(counts))) %>%
-  ungroup() %>%
-  {set_names(.$counts, .$dataset)}
+all_counts <- deseq_input %>%
+  pull(counts_deseq) %>%
+  map(
+    ~.x %>%
+      as.data.frame() %>%
+      rownames_to_column("ensembl_gene_id")
+  ) %>%
+  purrr::reduce(full_join, by = "ensembl_gene_id") %>%
+  mutate_at(vars(-ensembl_gene_id), replace_na, 0)
 
 # Adding count matrices for each condition
 comps_inputs <- comps_meta %>%
-  unnest(samples) %>%
   select(-samples, -controls) %>%
   mutate(
-    counts_deseq = map2(
-      deseq_meta, dataset,
-      ~dataset_counts[[.y]] %>%
-        filter(sample_id %in% rownames(.x)) %>%
-        dplyr::select(ensembl_gene_id, sample_id, count) %>%
-        # filter(sample_id %in% rownames(meta_deseq)) %>%
-        spread(sample_id, count) %>%
-        mutate_at(vars(-ensembl_gene_id), replace_na, replace = 0) %>%
+    counts_deseq = map(
+      meta_deseq,
+      ~all_counts %>%
+        select(ensembl_gene_id, one_of(rownames(.x))) %>%
         column_to_rownames("ensembl_gene_id") %>%
         as.matrix()
     )
   )
 
-run_deseq_comp <- function(deseq_meta, counts_deseq, ...) {
-  design <- if (length(unique(deseq_meta[["batch"]])) > 1) ~treatment + batch else ~treatment
+run_deseq_comp <- function(meta_deseq, counts_deseq, ...) {
+  design <- if (length(unique(meta_deseq[["batch"]])) > 1) ~treatment + batch else ~treatment
   library(tidyverse)
   suppressMessages(
     DESeq2::DESeqDataSetFromMatrix(
       counts_deseq %>%
         {.[, order(colnames(.))]},
-      deseq_meta %>%
+      meta_deseq %>%
         {.[order(rownames(.)), ]},
       design = design
     )
@@ -140,27 +133,32 @@ comp_deseqs <- comps_inputs %>%
     )
   )
 
-plan(multisession(workers = 4))
+unloadNamespace("synapser")
+unloadNamespace("PythonEmbedInR")
+
+# plan(multisession(workers = 4))
 comp_deseqs_calc <- comp_deseqs %>%
   # dplyr::rename(meta = deseq_meta) %>%
   mutate(
-    deseq = future_map(
+    # deseq = future_map(
+    #   deseq,
+    #   DESeq,
+    #   .progress = TRUE
+    # )
+    deseq = map(
       deseq,
-      DESeq,
-      .progress = TRUE
+      DESeq
     )
   )
 
 
 write_rds(
-  comp_deseqs_calc,
+  comp_deseqs_calc %>%
+    select(-meta_deseq, -counts_deseq),
   here("deseq", "deseq_treatment_vs_control.rds"),
   compress = "gz"
 )
-comp_deseqs_calc <- read_rds(here("deseq", "deseq_treatment_vs_control.rds"))
-
-unloadNamespace("synapser")
-unloadNamespace("PythonEmbedInR")
+# comp_deseqs_calc <- read_rds(here("deseq", "deseq_treatment_vs_control.rds"))
 
 
 comp_res <- comp_deseqs_calc %>%
@@ -187,7 +185,8 @@ comp_res <- comp_deseqs_calc %>%
 # comp_res_df <- comp_res %>%
 #   select(name, method, cell_line, drug, concentration, time, result)
 write_rds(
-  comp_res,
+  comp_res %>%
+    select(-deseq),
   here("deseq", "deseq_treatment_vs_control_result.rds"),
   compress = "gz"
 )
@@ -391,6 +390,7 @@ activity <- synapser::Activity(
 )
 
 c(
+  here("deseq", "deseq_treatment_vs_control.rds"),
   here("deseq", "deseq_treatment_vs_control_result.rds"),
   here("deseq", "deseq_treatment_vs_control_conc_result.rds"),
   here("deseq", "deseq_treatment_vs_control_conc.rds")
