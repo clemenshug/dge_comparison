@@ -73,9 +73,9 @@ MAX_PER_QUERY = 25
 comp_res_clue <- comp_res_entrez %>%
   filter(
     map_lgl(result, ~nrow(filter(.x, padj < 0.05)) > 20)
-  )  %>%
+  ) %>%
   mutate(
-    gene_set = paste(dataset, drug, cells, drug, stim, stim_conc, time, sep = "_") %>%
+    gene_set = condition_conc %>%
       str_replace_all("\\s", "_") %>%
       str_replace_all("[^\\w]", ""),
     result = map(
@@ -106,17 +106,50 @@ comp_res_jobs <- comp_res_clue %>%
     )
   )
 
+comp_res_jobs <- c(
+  "5eb305a5d58eba0011f9031c",
+  "5eb305a6ed2e4f0011539a5c",
+  "5eb305a6d58eba0011f9031e",
+  "5eb305a6ed2e4f0011539a5e",
+  "5eb305a6d58eba0011f90320",
+  "5eb305a7ed2e4f0011539a60"
+)
+
 
 walk(
   comp_res_jobs,
   clue_query_wait
 )
 
+comp_res_clue_res <- map_chr(
+  comp_res_jobs,
+  clue_query_download
+)
 
 ```
-Download from Clue after submission, download within R was buggy
 
 Put into synapse at syn21644366
+
+
+```{r}
+activity <- synapser::Activity(
+  name = "Query clue",
+  used = c(
+    "syn21559859",
+    "syn21547101",
+    "syn21547097",
+    "syn21547102"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/07_query_clue.Rmd"
+)
+
+c(
+  comp_res_clue_res
+) %>%
+  synStoreMany(parentId = "syn21644366", activity = activity)
+
+
+```
 
 
 ```{r pull_signatures}
@@ -138,6 +171,7 @@ cmap_paths <- list(
   )
 
 signatures_dge <- signature_meta %>%
+  distinct() %>%
   drop_na(lspci_id) %>%
   filter(lspci_id %in% comp_res_selected[["lspci_id"]])
 
@@ -180,10 +214,13 @@ write_rds(
 ```{r querying_cmap_with_l1000}
 # Take only highest concentration / longest time
 selected_signatures <- signatures_dge %>%
-  group_by(lspci_id, pert_iname, cell_id) %>%
-  arrange(desc(pert_dose), desc(pert_time)) %>%
-  slice(1) %>%
-  ungroup()
+  semi_join(
+    arrange(., desc(pert_dose), desc(pert_time)) %>%
+      group_by(lspci_id, pert_iname, cell_id) %>%
+      slice(1) %>%
+      ungroup(),
+    by = c("lspci_id", "pert_iname", "cell_id", "pert_dose", "pert_time")
+  )
 
 zscores_selected_signatures <- cmap_df %>%
   select(entrez_id, one_of(selected_signatures[["sig_id"]])) %>%
@@ -197,29 +234,45 @@ zscores_selected_signatures <- cmap_df %>%
 # Aggregating multiple cells using procedure by 10.1016/j.cell.2017.10.049
 zscores_selected_signatures_agg <- zscores_selected_signatures %>%
   as.data.table() %>%
-  .[
-    ,
-    .(zscore_agg = quantile(zscore, c(0.67, 0.33), names = FALSE) %>%
-      {.[order(abs(.))[2]]}
-    ),
-    by = c("entrez_id", "lspci_id")
-  ] %>%
+  {
+    # First aggregate replicates within same cell line
+    .[
+      ,
+      .(zscore = mean(zscore)),
+      keyby = c("entrez_id", "lspci_id", "cell_id")
+    ][
+      # Then across cell lines
+      ,
+      .(zscore_agg = quantile(zscore, c(0.67, 0.33), names = FALSE) %>%
+        {.[order(abs(.))[2]]}
+      ),
+      by = c("entrez_id", "lspci_id")
+    ]
+  } %>%
   as_tibble()
 
-selected_signatures_gene_sets <- zscores_selected_signatures_agg %>%
-  filter(abs(zscore_agg) > 1.645) %>%
-  arrange(desc(abs(zscore_agg))) %>%
-  transmute(
-    gene_id = entrez_id,
-    direction = if_else(zscore_agg > 0, "up", "down"),
-    gene_set = as.character(lspci_id)
-  )
-
+# Using different quantile cutoffs for the z-score
+selected_signatures_gene_sets <- tibble(
+  cutoff = c(0.7, 0.8, 0.9, 0.95)
+) %>%
+  mutate(
+    data = map(
+      cutoff,
+      ~zscores_selected_signatures_agg %>%
+        filter(abs(zscore_agg) > qnorm(.x)) %>%
+        arrange(desc(abs(zscore_agg))) %>%
+        transmute(
+          gene_id = entrez_id,
+          direction = if_else(zscore_agg > 0, "up", "down"),
+          gene_set = paste0(lspci_id, "_", .x)
+        )
+    )
+  ) %>%
+  unnest(data) %>%
+  group_nest(gene_set)
 
 MAX_PER_QUERY = 25
 selected_signatures_gmts <- selected_signatures_gene_sets %>%
-  # filter(gene_set == 1726) %>%
-  group_nest(gene_set) %>%
   filter(
     map_lgl(data, ~nrow(.) > 20)
   ) %>%
@@ -264,7 +317,7 @@ activity <- synapser::Activity(
 )
 
 c(
-  selected_signatures_dls
+  unname(selected_signatures_dls)
 ) %>%
   synStoreMany(parentId = "syn21644366", activity = activity)
 
@@ -277,7 +330,12 @@ Put into synapse at syn21644366
 
 ```{r}
 clue_res_raw <- synChildren("syn21644366") %>%
-  map(syn)
+  map(syn) %>%
+  keep(function(x) length(x) > 0)
+
+# clue_res_raw %>%
+#   magrittr::extract(str_starts(names(.), "my_")) %>%
+#   map(synapser::synMove, new_parent = "syn22024427")
 
 clue_res <- crossing(
   score_type = "tau",
@@ -297,7 +355,7 @@ clue_res <- crossing(
 
 write_rds(
   clue_res,
-  file.path(wd, "clue_results_conc.rds"),
+  file.path(wd, "clue_results_raw.rds"),
   compress = "gz"
 )
 ```
@@ -306,7 +364,7 @@ write_rds(
 
 c(
   file.path(wd, "cmap_signatures_profiled.rds"),
-  file.path(wd, "clue_results_conc.rds")
+  file.path(wd, "clue_results_raw.rds")
 ) %>%
   synStoreMany(parentId = "syn21547022", activity = activity)
 
