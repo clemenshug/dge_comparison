@@ -10,9 +10,7 @@ library(synExtra)
 library(tidyverse)
 library(cmapR)
 library(here)
-library(egg)
 library(broom)
-library(ggrepel)
 
 synapser::synLogin()
 syn <- synExtra::synDownloader("data")
@@ -25,17 +23,19 @@ theme_set(theme_bw())
 
 
 ```{r load}
-clue_res <- syn("syn21646960") %>%
+clue_res <- syn("syn22105449") %>%
   read_rds()
 
 pertubation_meta <- syn("syn21547097") %>%
   read_csv()
 
-diff_exp_by_conc <- syn("syn21559856") %>%
+diff_exp_by_conc <- syn("syn21559859") %>%
   read_rds()
 
-compound_dict <- syn("syn21094266") %>%
-  read_csv()
+compound_dict <- syn("syn20835543") %>%
+  read_rds() %>%
+  filter(fp_name == "morgan_normal") %>%
+  chuck("data", 1)
 
 ```
 
@@ -45,7 +45,7 @@ diff_exp_by_conc <- diff_exp_by_conc %>%
   mutate(
     # Create same unique identifier for diff expression datasets
     # that was used for Clue query
-    gene_set = paste(dataset, drug, cells, drug, stim, stim_conc, time, sep = "_") %>%
+    gene_set = condition_conc %>%
       str_replace_all("\\s", "_") %>%
       str_replace_all("[^\\w]", "")
   )
@@ -59,21 +59,25 @@ annotate_clue_res <- function(data, result_type, score_level, source, ...) {
     data_out <- mutate_at(data_out, vars(cell_id), str_to_lower) %>%
       rename(cell_id_target = cell_id)
   
-  data_out <- if (source == "dge") {
-    # Add metadata from the DGE differential expression
-    inner_join(
-      data_out,
-      diff_exp_by_conc %>%
-        distinct(gene_set, dataset_query = dataset, cell_id_query = str_to_lower(cells), lspci_id_query = lspci_id),
-      by = "gene_set"
-    )
-  } else {
-    # Metadata for L1000 queries is just the drug id
-    # since all cell types where merged for query
-    mutate(
-      data_out,
-      lspci_id_query = as.numeric(str_sub(gene_set, 2L))
-    )
+  data_out <- {
+    if (source == "dge") {
+      # Add metadata from the DGE differential expression
+      inner_join(
+        data_out,
+        diff_exp_by_conc %>%
+          distinct(gene_set, cell_id_query = str_to_lower(cells), lspci_id_query = lspci_id),
+        by = "gene_set"
+      )
+    } else {
+      # Gene set names for l1000 queries have format X{lspci_id}_{optional_query_cell_id}_{z-score cutoff}
+      l1000_meta <- str_match(data_out[["gene_set"]], "^X(\\d+)_?([\\w-]+)?_([\\d\\.]+)$")
+      mutate(
+        data_out,
+        lspci_id_query = as.numeric(l1000_meta[, 2]),
+        cell_id_query = l1000_meta[, 3],
+        z_score_cutoff = as.numeric(l1000_meta[, 4])
+      )
+    }
   } %>%
     inner_join(
       compound_dict %>%
@@ -111,7 +115,8 @@ clue_res_both <- clue_res %>%
     data = map(
       data,
       group_nest,
-      source = if_else(str_starts(gene_set, fixed("X")), "l1000", "dge"),
+      # Gene set names for l1000 queries have format X{lspci_id}_{z-score cutoff}
+      source = if_else(str_starts(gene_set, "X\\d+_"), "l1000", "dge"),
       keep = TRUE
     )
   ) %>%
@@ -171,6 +176,7 @@ c(
   file.path(wd, "clue_results_combined.rds")
 ) %>%
   synStoreMany(parentId = "syn21547022", activity = activity)
+
 ```
 
 

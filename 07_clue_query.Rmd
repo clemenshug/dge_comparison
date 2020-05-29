@@ -62,15 +62,14 @@ comp_res_entrez <- comp_res_selected %>%
       result,
       function(df) {
         df %>%
-          {suppressWarnings(join_hgnc(., "ensembl_gene_id", "ensembl_gene_id", "entrez_id"))} %>%
+          {suppressWarnings(join_hgnc(., "ensembl_gene_id", "ensembl_gene_id", c("symbol", "entrez_id")))} %>%
           # select(-symbol) %>%
           dplyr::rename(gene_id = entrez_id)
       }
     )
   )
 
-MAX_PER_QUERY = 25
-comp_res_clue <- comp_res_entrez %>%
+comp_res_gene_sets <- comp_res_entrez %>%
   filter(
     map_lgl(result, ~nrow(filter(.x, padj < 0.05)) > 20)
   ) %>%
@@ -86,7 +85,10 @@ comp_res_clue <- comp_res_entrez %>%
         filter(padj < 0.05) %>%
         mutate(direction = if_else(log2FoldChange < 0, "down", "up"))
     )
-  ) %>%
+  )
+
+MAX_PER_QUERY = 25
+comp_res_clue <- comp_res_gene_sets %>%
   split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
   map(
     ~bind_rows(set_names(.x[["result"]], .x[["gene_set"]]), .id = "gene_set") %>%
@@ -204,8 +206,8 @@ write_rds(
   compress = "gz"
 )
 
-# cmap_df <- file.path(wd, "cmap_signatures_profiled.rds") %>%
-#   read_rds()
+cmap_df <- file.path(wd, "cmap_signatures_profiled.rds") %>%
+  read_rds()
 ```
 
 
@@ -262,17 +264,22 @@ selected_signatures_gene_sets <- tibble(
         filter(abs(zscore_agg) > qnorm(.x)) %>%
         arrange(desc(abs(zscore_agg))) %>%
         transmute(
-          gene_id = entrez_id,
+          lspci_id,
+          gene_id = as.character(entrez_id),
           direction = if_else(zscore_agg > 0, "up", "down"),
           gene_set = paste0(lspci_id, "_", .x)
-        )
+        ) %>%
+        {suppressWarnings(join_hgnc(., "gene_id", "entrez_id", "symbol"))}
     )
   ) %>%
   unnest(data) %>%
-  group_nest(gene_set)
+  group_nest(gene_set, lspci_id, cutoff)
+
 
 MAX_PER_QUERY = 25
 selected_signatures_gmts <- selected_signatures_gene_sets %>%
+  # filter(gene_set == 1726) %>%
+  # group_nest(gene_set) %>%
   filter(
     map_lgl(data, ~nrow(.) > 20)
   ) %>%
@@ -322,9 +329,259 @@ c(
   synStoreMany(parentId = "syn21644366", activity = activity)
 
 ```
-Download from Clue after submission, download within R was buggy
 
-Put into synapse at syn21644366
+
+```{r querying_cmap_with_l1000_measured_only}
+# Take only highest concentration / longest time
+selected_signatures <- signatures_dge %>%
+  semi_join(
+    arrange(., desc(pert_dose), desc(pert_time)) %>%
+      group_by(lspci_id, pert_iname, cell_id) %>%
+      slice(1) %>%
+      ungroup(),
+    by = c("lspci_id", "pert_iname", "cell_id", "pert_dose", "pert_time")
+  )
+
+zscores_selected_signatures <- cmap_df %>%
+  filter(
+    pr_gene_id %in% {
+      filter(cmap_gene_meta, pr_is_lm == 1) %>% pull(pr_gene_id)
+    }
+  ) %>%
+  select(entrez_id, one_of(selected_signatures[["sig_id"]])) %>%
+  gather("sig_id", "zscore", -entrez_id) %>%
+  inner_join(
+    signatures_dge %>%
+      select(sig_id, lspci_id, cell_id),
+    by = "sig_id"
+  )
+
+# Aggregating multiple cells using procedure by 10.1016/j.cell.2017.10.049
+zscores_selected_signatures_agg <- zscores_selected_signatures %>%
+  as.data.table() %>%
+  {
+    # First aggregate replicates within same cell line
+    .[
+      ,
+      .(zscore = mean(zscore)),
+      keyby = c("entrez_id", "lspci_id", "cell_id")
+    ][
+      # Then across cell lines
+      ,
+      .(zscore_agg = quantile(zscore, c(0.67, 0.33), names = FALSE) %>%
+        {.[order(abs(.))[2]]}
+      ),
+      by = c("entrez_id", "lspci_id")
+    ]
+  } %>%
+  as_tibble()
+
+selected_signatures_measured_only_gene_sets <- tibble(
+  cutoff = c(0.7, 0.8, 0.9, 0.95)
+) %>%
+  mutate(
+    data = map(
+      cutoff,
+      ~zscores_selected_signatures_agg %>%
+        filter(abs(zscore_agg) > qnorm(.x)) %>%
+        arrange(desc(abs(zscore_agg))) %>%
+        transmute(
+          lspci_id,
+          gene_id = as.character(entrez_id),
+          direction = if_else(zscore_agg > 0, "up", "down"),
+          gene_set = paste0(lspci_id, "_", .x)
+        ) %>%
+        {suppressWarnings(join_hgnc(., "gene_id", "entrez_id", "symbol"))}
+    )
+  ) %>%
+  unnest(data) %>%
+  group_nest(gene_set, lspci_id, cutoff)
+
+
+MAX_PER_QUERY = 25
+selected_signatures_gmts <- selected_signatures_measured_only_gene_sets %>%
+  # filter(gene_set == 1726) %>%
+  filter(
+    map_lgl(data, ~nrow(.) > 20)
+  ) %>%
+  split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
+  map(
+    ~bind_rows(set_names(.x[["data"]], .x[["gene_set"]]), .id = "gene_set") %>%
+      select(gene_set, gene_id, direction)
+  ) %>%
+  map(
+    clue_gmt_from_df,
+    drop_invalid = TRUE
+  )
+
+selected_signatures_jobs <- selected_signatures_gmts %>%
+  imap(
+    ~clue_query_submit(
+      .x[["up"]], .x[["down"]],
+      name = paste0("l1000_job_", .y),
+      use_fast_tool = FALSE
+    )
+  )
+
+walk(
+  selected_signatures_jobs,
+  clue_query_wait
+)
+
+
+selected_signatures_dls <- selected_signatures_jobs %>%
+  map_chr(clue_query_download)
+
+new_names <- file.path(dirname(selected_signatures_dls), paste0("l1000_query_measured_only_", 1:length(selected_signatures_dls), ".tar.gz"))
+
+file.rename(
+  selected_signatures_dls,
+  new_names
+)
+
+activity <- synapser::Activity(
+  name = "Query clue",
+  used = c(
+    "syn21559859",
+    "syn21547101",
+    "syn21547097",
+    "syn21547102",
+    "syn21551046",
+    "syn21551043"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/07_query_clue.Rmd"
+)
+
+c(
+  new_names
+) %>%
+  synStoreMany(parentId = "syn21644366", activity = activity)
+
+```
+
+Query using all signatures for Torin-1 seperately, not aggregating by cell line
+
+```{r querying_cmap_with_l1000_single_cell_line}
+# Take only highest concentration / longest time
+selected_signatures <- signatures_dge %>%
+  semi_join(
+    arrange(., desc(pert_dose), desc(pert_time)) %>%
+      group_by(lspci_id, pert_iname, cell_id) %>%
+      slice(1) %>%
+      ungroup(),
+    by = c("lspci_id", "pert_iname", "cell_id", "pert_dose", "pert_time")
+  ) %>%
+  filter(pert_iname == "torin-1")
+
+zscores_selected_signatures <- cmap_df %>%
+  filter(
+    pr_gene_id %in% {
+      filter(cmap_gene_meta) %>% pull(pr_gene_id)
+    }
+  ) %>%
+  select(entrez_id, one_of(selected_signatures[["sig_id"]])) %>%
+  gather("sig_id", "zscore", -entrez_id) %>%
+  inner_join(
+    signatures_dge %>%
+      select(sig_id, lspci_id, cell_id),
+    by = "sig_id"
+  )
+
+# Aggregating multiple cells using procedure by 10.1016/j.cell.2017.10.049
+zscores_selected_signatures_agg <- zscores_selected_signatures %>%
+  as.data.table() %>%
+  {
+    # First aggregate replicates within same cell line
+    .[
+      ,
+      .(zscore_agg = mean(zscore)),
+      keyby = c("entrez_id", "lspci_id", "cell_id")
+    ]
+  } %>%
+  as_tibble()
+
+selected_signatures_per_cell_gene_sets <- tibble(
+  cutoff = c(0.7, 0.8, 0.9, 0.95)
+) %>%
+  mutate(
+    data = map(
+      cutoff,
+      ~zscores_selected_signatures_agg %>%
+        filter(abs(zscore_agg) > qnorm(.x)) %>%
+        arrange(desc(abs(zscore_agg))) %>%
+        transmute(
+          lspci_id,
+          cell_id,
+          gene_id = as.character(entrez_id),
+          direction = if_else(zscore_agg > 0, "up", "down"),
+          gene_set = paste0(lspci_id, "_", cell_id, "_", .x)
+        ) %>%
+        {suppressWarnings(join_hgnc(., "gene_id", "entrez_id", "symbol"))}
+    )
+  ) %>%
+  unnest(data) %>%
+  group_nest(gene_set, lspci_id, cell_id, cutoff)
+
+
+MAX_PER_QUERY = 25
+selected_signatures_gmts <- selected_signatures_per_cell_gene_sets %>%
+  # filter(gene_set == 1726) %>%
+  filter(
+    map_lgl(data, ~nrow(.) > 20)
+  ) %>%
+  split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
+  map(
+    ~bind_rows(set_names(.x[["data"]], .x[["gene_set"]]), .id = "gene_set") %>%
+      select(gene_set, gene_id, direction)
+  ) %>%
+  map(
+    clue_gmt_from_df,
+    drop_invalid = TRUE
+  )
+
+selected_signatures_jobs_by_cell <- selected_signatures_gmts %>%
+  imap(
+    ~clue_query_submit(
+      .x[["up"]], .x[["down"]],
+      name = paste0("l1000_job_", .y),
+      use_fast_tool = FALSE
+    )
+  )
+
+walk(
+  selected_signatures_jobs_by_cell,
+  clue_query_wait
+)
+
+selected_signatures_dls <- selected_signatures_jobs_by_cell %>%
+  map_chr(clue_query_download)
+
+new_names <- file.path(dirname(selected_signatures_dls), paste0("l1000_query_per_cell_line_", 1:length(selected_signatures_dls), ".tar.gz"))
+
+file.rename(
+  selected_signatures_dls,
+  new_names
+)
+
+activity <- synapser::Activity(
+  name = "Query clue",
+  used = c(
+    "syn21559859",
+    "syn21547101",
+    "syn21547097",
+    "syn21547102",
+    "syn21551046",
+    "syn21551043"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/07_query_clue.Rmd"
+)
+
+c(
+  unname(new_names)
+) %>%
+  synStoreMany(parentId = "syn21644366", activity = activity)
+
+```
 
 
 
@@ -348,14 +605,21 @@ clue_res <- crossing(
       function(...) {
         clue_res_raw %>%
           map(clue_parse_result, ...) %>%
-          bind_rows()
+          bind_rows(.id = "query_type") %>%
+          mutate(
+            query_type = case_when(
+              str_detect(query_type, fixed("measured_only")) ~ "measured_only",
+              str_detect(query_type, fixed("per_cell_line")) ~ "per_cell_line",
+              TRUE ~ "aggregated"
+            )
+          )
       }
     )
   )
 
 write_rds(
   clue_res,
-  file.path(wd, "clue_results_raw.rds"),
+  file.path(wd, "clue_results_conc.rds"),
   compress = "gz"
 )
 ```
@@ -363,8 +627,8 @@ write_rds(
 ```{r synapse}
 
 c(
-  file.path(wd, "cmap_signatures_profiled.rds"),
-  file.path(wd, "clue_results_raw.rds")
+  # file.path(wd, "cmap_signatures_profiled.rds"),
+  file.path(wd, "clue_results_conc.rds")
 ) %>%
   synStoreMany(parentId = "syn21547022", activity = activity)
 
