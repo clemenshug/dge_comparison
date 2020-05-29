@@ -63,7 +63,6 @@ comp_res_entrez <- comp_res_selected %>%
       function(df) {
         df %>%
           {suppressWarnings(join_hgnc(., "ensembl_gene_id", "ensembl_gene_id", c("symbol", "entrez_id")))} %>%
-          # select(-symbol) %>%
           dplyr::rename(gene_id = entrez_id)
       }
     )
@@ -629,6 +628,50 @@ write_rds(
 c(
   # file.path(wd, "cmap_signatures_profiled.rds"),
   file.path(wd, "clue_results_conc.rds")
+) %>%
+  synStoreMany(parentId = "syn21547022", activity = activity)
+
+```
+
+```{r save_gene_sets}
+all_gene_sets <- tribble(
+  ~source, ~query_type, ~data,
+  "dge", NA_character_, rename(comp_res_gene_sets, data = result),
+  "l1000", "aggregated", selected_signatures_gene_sets,
+  "l1000", "per_cell_line", selected_signatures_per_cell_gene_sets,
+  "l1000", "measured_only", selected_signatures_measured_only_gene_sets
+) %>%
+  mutate(
+    data = map(
+      data,
+      ~.x %>%
+        mutate_at(vars(data), map, ~select(.x, gene_id, symbol, direction))
+    )
+  ) %>%
+  unnest(data) %>%
+  select(source, query_type, gene_set, drug_id, lspci_id, cell_id, cutoff, data) %>%
+  unnest(data)
+
+write_csv(
+  all_gene_sets,
+  file.path(wd, "all_gene_sets.csv.gz")
+)
+
+activity <- synapser::Activity(
+  name = "Query clue",
+  used = c(
+    "syn21559859",
+    "syn21547101",
+    "syn21547097",
+    "syn21547102",
+    "syn21551046",
+    "syn21551043"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/07_query_clue.Rmd"
+)
+
+c(
+  file.path(wd, "all_gene_sets.csv.gz")
 ) %>%
   synStoreMany(parentId = "syn21547022", activity = activity)
 
