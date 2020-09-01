@@ -7,14 +7,11 @@ output: html_document
 
 ```{r setup, include=FALSE}
 library(tidyverse)
-library(DESeq2)
-library(VennDiagram)
-library(UpSetR)
 library(here)
 library(synExtra)
 
 synapser::synLogin()
-syn <- synDownloader("~/data/DGE_comp/")
+syn <- synDownloader(here("data"))
 
 paste_ <- function(...) {
   paste(..., sep = "_")
@@ -22,7 +19,7 @@ paste_ <- function(...) {
 ```
 
 Calculating differentially expressed genes between drug treatment conditions
-and control for DGE and bulk RNA-seq separately.
+and control for DGE.
 
 ```{r read_data}
 deseq_input <- syn("syn21558154") %>%
@@ -31,353 +28,152 @@ deseq_input <- syn("syn21558154") %>%
 ```
 
 
-Checking which conditions have a complete set of samples, with at least 2 replicates.
-Removing singleton samples without replicate.
-
-
-```{r building_deseq_meta}
-MIN_N <- 2L
-
-match_samples <- function(meta) {
-  samples <- meta %>%
-    filter(condition != control_condition) %>%
-    mutate(treatment = "treatment") %>%
-    group_nest(condition, control_condition, .key = "samples")
-  controls <- meta %>%
-    filter(condition == control_condition) %>%
-    mutate(treatment = "control") %>%
-    select(-condition) %>%
-    group_nest(control_condition, .key = "controls")
-  samples %>%
-    left_join(controls, by = "control_condition") %>%
-    filter(map2_lgl(samples, controls, ~nrow(.x) >= MIN_N & nrow(.y) >= MIN_N)) %>%
-    mutate(
-      meta_deseq = map2(
-        samples, controls,
-        bind_rows
-      ) %>%
-        map(
-          ~.x %>%
-            column_to_rownames("sample_id")
-        )
-    ) %>%
-    # Add back the information about the condition, like conc, drug etc.
-    # Can't keep drug here because it may be different in different experiments
-    # Use normalized drug_id instead
-    left_join(
-      meta %>%
-        distinct(condition, cells, drug_id, lspci_id, drug_conc, stim, stim_conc),
-      by = "condition"
-    )
-}
-
-comps_meta <- deseq_input %>%
-  transmute(
-    batch,
-    meta = map(meta_deseq, rownames_to_column, "sample_id")
-  ) %>%
-  unnest(meta) %>%
-  match_samples()
-
-```
-
-
-
-
 
 
 ```{r deseq_drugs_vs_control}
-all_counts <- deseq_input %>%
-  pull(counts_deseq) %>%
-  map(
-    ~.x %>%
-      as.data.frame() %>%
-      rownames_to_column("ensembl_gene_id")
-  ) %>%
-  purrr::reduce(full_join, by = "ensembl_gene_id") %>%
-  mutate_at(vars(-ensembl_gene_id), replace_na, 0)
+wd <- here("deseq", "treatment_vs_control")
+dir.create(wd)
 
-# Adding count matrices for each condition
-comps_inputs <- comps_meta %>%
-  select(-samples, -controls) %>%
+chunked_deseq_input <- deseq_input %>%
+  lspcheminf::chunk_df(100, seed = 1) %>%
+  enframe(name = "chunk", value = "data") %>%
   mutate(
-    counts_deseq = map(
-      meta_deseq,
-      ~all_counts %>%
-        select(ensembl_gene_id, one_of(rownames(.x))) %>%
-        column_to_rownames("ensembl_gene_id") %>%
-        as.matrix()
-    )
+    input_file = file.path(wd, paste0("deseq_input_", chunk, ".rds")),
+    output_file = file.path(wd, paste0("deseq_result_", chunk, ".rds"))
+  ) %>%
+  # Have to get rid of some spurious samples where there is only control and some
+  # other controls, eg. LPS
+  rowwise() %>%
+  mutate(
+    data = data %>%
+      filter(map_lgl(samples, ~!all(.x[["drug_conc"]] == 0))) %>%
+      list()
   )
 
-run_deseq_comp <- function(meta_deseq, counts_deseq, ...) {
-  design <- if (length(unique(meta_deseq[["batch"]])) > 1) ~treatment + batch else ~treatment
+pwalk(
+  chunked_deseq_input,
+  function(data, input_file, ...) {
+    write_rds(
+      data,
+      input_file,
+      compress = "gz"
+    )
+  }
+)
+
+process_deseq <- function(input, output) {
   library(tidyverse)
-  suppressMessages(
-    DESeq2::DESeqDataSetFromMatrix(
+  unloadNamespace("synapser")
+  unloadNamespace("PythonEmbedInR")
+  
+  run_deseq_comp <- function(meta_deseq, counts_deseq, design, ...) {
+    attr(design, ".Environment") <- baseenv()
+    de <- DESeq2::DESeqDataSetFromMatrix(
       counts_deseq %>%
         {.[, order(colnames(.))]},
       meta_deseq %>%
         {.[order(rownames(.)), ]},
       design = design
+    ) %>%
+      DESeq2::DESeq()
+    name <- DESeq2::resultsNames(de)[[2]]
+    res <- DESeq2::results(de, name = name, alpha = 0.05)
+    shrunk <- DESeq2::lfcShrink(de, coef = name, res = res, type = "apeglm")
+    out_res <- as.data.frame(shrunk) %>%
+      rownames_to_column("ensembl_gene_id") %>%
+      as_tibble() %>%
+      left_join(
+        as.data.frame(res) %>%
+          rownames_to_column("ensembl_gene_id") %>%
+          select(ensembl_gene_id, log2FoldChange_MLE = log2FoldChange),
+        by = "ensembl_gene_id"
+      )
+    list(
+      deseq_object = de,
+      results = out_res
     )
+  }
+  deseq_input <- read_rds(input)
+  res <- pmap(deseq_input, run_deseq_comp)
+  write_rds(
+    res %>%
+      map("results"),
+    output,
+    compress = "gz"
   )
 }
 
-comp_deseqs <- comps_inputs %>%
-  # dplyr::rename(meta = deseq_meta) %>%
-  mutate(
-    deseq = pmap(
-      .,
-      run_deseq_comp
-    )
+library(batchtools)
+
+reg <- makeRegistry(
+  file.dir = file.path(wd, paste0("registry_", gsub(" ", "_", Sys.time()))),
+  seed = 1
+)
+# reg <- loadRegistry()
+
+batchMap(
+  fun = process_deseq,
+  input = chunked_deseq_input[["input_file"]],
+  output = chunked_deseq_input[["output_file"]]
+)
+
+job_table <- findJobs() %>%
+  # Chunk jobs into a single array job
+  mutate(chunk = 1)
+
+
+submitJobs(
+  job_table,
+  resources = list(
+    memory = "10gb",
+    ncpus = 1L,
+    partition = "short",
+    walltime = 20*60,
+    chunks.as.arrayjobs = TRUE,
+    # For some reason these nodes fail to execute R because of an "illegal instruction"
+    exclude = "compute-f-17-[09-25]"
   )
+)
 
-unloadNamespace("synapser")
-unloadNamespace("PythonEmbedInR")
 
-# plan(multisession(workers = 4))
-comp_deseqs_calc <- comp_deseqs %>%
-  # dplyr::rename(meta = deseq_meta) %>%
+deseq_results <- chunked_deseq_input %>%
+  ungroup() %>%
   mutate(
-    # deseq = future_map(
-    #   deseq,
-    #   DESeq,
-    #   .progress = TRUE
-    # )
-    deseq = map(
-      deseq,
-      DESeq
+    data = map2(
+      data, output_file,
+      # ~.x[["results"]] <- read_rds(.y)
+      function(data, output_file) {
+        x <- read_rds(output_file)
+        if (nrow(data) != length(x))
+          browser()
+        data[["results"]] <- x
+        data
+      }
     )
-  )
+  ) %>%
+  pull(data) %>%
+  bind_rows()
 
+# x <- deseq_results %>%
+#   mutate(
+#     results = map2(
+#       results, concentration_method,
+#       function(results, concentration_method)  {
+#         if (concentration_method == "concentration_aggregated")
+#           return(results)
+#         results %>%
+#           mutate(across(starts_with("log2"), ~.x*-1))
+#       }
+#     )
+#   )
 
 write_rds(
-  comp_deseqs_calc %>%
-    select(-meta_deseq, -counts_deseq),
+  deseq_results,
   here("deseq", "deseq_treatment_vs_control.rds"),
   compress = "gz"
 )
-# comp_deseqs_calc <- read_rds(here("deseq", "deseq_treatment_vs_control.rds"))
-
-
-comp_res <- comp_deseqs_calc %>%
-  mutate(
-    result = map(
-      deseq,
-      function(d) {
-        name <- "treatment_treatment_vs_control"
-        res <- results(d, name = name, alpha = 0.05)
-        shrunk <- lfcShrink(d, coef = name, res = res, type = "apeglm")
-        as.data.frame(shrunk) %>%
-          rownames_to_column("ensembl_gene_id") %>%
-          as_tibble() %>%
-          left_join(
-            as.data.frame(res) %>%
-              rownames_to_column("ensembl_gene_id") %>%
-              select(ensembl_gene_id, log2FoldChange_MLE = log2FoldChange),
-            by = "ensembl_gene_id"
-          )
-      }
-    )
-  )
-
-# comp_res_df <- comp_res %>%
-#   select(name, method, cell_line, drug, concentration, time, result)
-write_rds(
-  comp_res %>%
-    select(-deseq),
-  here("deseq", "deseq_treatment_vs_control_result.rds"),
-  compress = "gz"
-)
 
 ```
-
-# Using linear model with log transformed concentration
-
-```{r deseq_drug_vs_control_log_model}
-MIN_N_CONC <- 2L
-
-condition_conc_vars <- c("cells", "drug_id", "lspci_id", "stim", "stim_conc", "time")
-
-match_samples_conc_model <- function(meta) {
-  meta_conc <- meta %>%
-    mutate(
-      condition_conc = exec(
-        paste,
-        !!!as.list(.)[condition_conc_vars],
-        sep = "_"
-      )
-    )
-  samples <- meta_conc %>%
-    filter(condition != control_condition) %>%
-    select(-condition) %>%
-    group_nest(condition_conc, control_condition, .key = "samples")
-  controls <- meta %>%
-    filter(condition == control_condition) %>%
-    select(-condition) %>%
-    group_nest(control_condition, .key = "controls")
-  samples %>%
-    left_join(controls, by = "control_condition") %>%
-    filter(
-      map2_lgl(samples, controls, ~length(unique(.x[["drug_conc"]])) >= MIN_N_CONC  & nrow(.y) >= MIN_N)
-    ) %>%
-    mutate(
-      deseq_meta = map2(
-        samples, controls,
-        bind_rows
-      ) %>%
-        map(
-          ~.x %>%
-            mutate(
-              conc_rank = as.double(
-                as.integer(factor(drug_conc, levels = sort(unique(drug_conc))))
-              ) - 1
-            ) %>%
-            column_to_rownames("sample_id")
-        )
-    ) %>%
-    left_join(
-      meta_conc %>%
-        select(condition_conc, one_of(condition_conc_vars)) %>%
-        distinct(),
-      by = "condition_conc"
-    )
-}
-
-comps_meta_conc <- deseq_input %>%
-  transmute(
-    dataset,
-    batch,
-    meta = map(meta_deseq, rownames_to_column, "sample_id")
-  ) %>%
-  unnest(meta) %>%
-  match_samples_conc_model
-
-all_counts <- deseq_input %>%
-  pull(counts_deseq) %>%
-  map(
-    ~.x %>%
-      as.data.frame() %>%
-      rownames_to_column("ensembl_gene_id")
-  ) %>%
-  purrr::reduce(full_join, by = "ensembl_gene_id") %>%
-  mutate_at(vars(-ensembl_gene_id), replace_na, 0)
-
-# Adding count matrices for each condition
-comps_inputs_conc <- comps_meta_conc %>%
-  select(-samples, -controls) %>%
-  mutate(
-    counts_deseq = map(
-      deseq_meta,
-      ~all_counts %>%
-        select(ensembl_gene_id, one_of(rownames(.x))) %>%
-        column_to_rownames("ensembl_gene_id") %>%
-        as.matrix()
-    )
-  )
-
-run_deseq_comp_conc <- function(deseq_meta, counts_deseq, condition_conc, ...) {
-  message(condition_conc)
-  design <- if (length(unique(deseq_meta[["batch"]])) > 1) ~conc_rank + batch else ~conc_rank
-  library(tidyverse)
-  suppressMessages(
-    DESeq2::DESeqDataSetFromMatrix(
-      counts_deseq %>%
-        {.[, order(colnames(.))]},
-      deseq_meta %>%
-        {.[order(rownames(.)), ]},
-      design = design
-    )
-  )
-}
-
-comp_deseqs_conc <- comps_inputs_conc %>%
-  # dplyr::rename(meta = deseq_meta) %>%
-  mutate(
-    deseq = pmap(
-      .,
-      run_deseq_comp_conc
-    )
-  )
-
-# write_rds(
-#   comp_deseqs_conc,
-#   "deseq_input_conc.rds"
-# )
-# comp_deseqs_conc <- read_rds("deseq_input_conc.rds")
-
-unloadNamespace("synapser")
-unloadNamespace("PythonEmbedInR")
-# library(future.apply)
-# plan(multicore(workers = 4))
-comp_deseqs_conc_calc <- comp_deseqs_conc %>%
-  # dplyr::rename(meta = deseq_meta) %>%
-  mutate(
-    deseq = map(
-      deseq,
-      DESeq
-    )
-    # deseq = map(
-    #   deseq,
-    #   DESeq,
-    #   BPPARAM = BiocParallel::MulticoreParam(workers = 4),
-    #   parallel = F
-    # )
-    # deseq = future_lapply(
-    #   deseq,
-    #   DESeq2::DESeq,
-    #   future.scheduling = 3,
-    #   parallel = F
-    # )
-  )
-
-
-write_rds(
-  comp_deseqs_conc_calc %>%
-    select(-deseq_meta, -counts_deseq),
-  here("deseq", "deseq_treatment_vs_control_conc.rds"),
-  compress = "gz"
-)
-# comp_deseqs_conc_calc <- read_rds(here("deseq", "deseq_treatment_vs_control_conc.rds"))
-
-
-
-# plan(multisession(workers = 4))
-# options(future.globals.maxSize = 1500 * 1024**2)
-comp_res_conc <- comp_deseqs_conc_calc %>%
-  mutate(
-    result = map(
-      deseq,
-      function(d) {
-        name <- "conc_rank"
-        res <- results(d, name = name, alpha = 0.1)
-        shrunk <- lfcShrink(d, coef = name, res = res, type = "apeglm")
-        as.data.frame(shrunk) %>%
-          rownames_to_column("ensembl_gene_id") %>%
-          as_tibble() %>%
-          left_join(
-            as.data.frame(res) %>%
-              rownames_to_column("ensembl_gene_id") %>%
-              select(ensembl_gene_id, log2FoldChange_MLE = log2FoldChange),
-            by = "ensembl_gene_id"
-          )
-      }
-    )
-  )
-
-# comp_res_df <- comp_res %>%
-#   select(name, method, cell_line, drug, concentration, time, result)
-write_rds(
-  comp_res_conc %>%
-    select(-deseq),
-  here("deseq", "deseq_treatment_vs_control_conc_result.rds"),
-  compress = "gz"
-)
-
-
-```
-
 
 
 ```{r synapse}
@@ -390,10 +186,7 @@ activity <- synapser::Activity(
 )
 
 c(
-  here("deseq", "deseq_treatment_vs_control.rds"),
-  here("deseq", "deseq_treatment_vs_control_result.rds"),
-  here("deseq", "deseq_treatment_vs_control_conc_result.rds"),
-  here("deseq", "deseq_treatment_vs_control_conc.rds")
+  here("deseq", "deseq_treatment_vs_control.rds")
 ) %>%
   synStoreMany(parentId = "syn21558153", activity = activity)
 

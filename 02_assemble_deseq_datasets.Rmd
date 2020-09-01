@@ -42,7 +42,7 @@ meta <- syn("syn22000707") %>%
 
 Using DESeq2 to normalize contact counts. Normalizing each batch separately.
 
-```{r deseq_normalization}
+```{r filter_samples}
 
 samples_passing <- counts_raw %>%
   inner_join(meta, by = c("dataset", "date", "plate", "batch")) %>%
@@ -66,26 +66,133 @@ samples_passing <- counts_raw %>%
     # Make sure only samples that are included in the metadata table are in count table
     counts = map2(counts, meta, ~drop_na(.x, sample_id) %>% filter(sample_id %in% .y$sample_id))
   )
+```
+
+Differential expression in different ways
+
+1. per_concentration vs concentration_aggregated
 
 
-data_sets_deseq <- samples_passing %>%
+2. per_replicate vs replicates_aggregated
+
+
+
+```{r assemble_comparisons}
+
+identical_vec <- function(vec, val) {
+  map_lgl(vec, identical, y = val)
+}
+
+find_comparisons <- function(meta, concentration_method, replicate_method) {
+  condition_vars <- c("cells", "stim", "stim_conc", "drug_id", "time")
+  condition_vars <- switch(
+    replicate_method,
+    per_replicate = union(condition_vars, c("dataset", "replicate")),
+    replicates_aggregated = condition_vars
+  )
+  condition_vars <- switch(
+    concentration_method,
+    per_concentration = union(condition_vars, c("drug_conc")),
+    concentration_aggregated = condition_vars
+  )
+  control_vars <- setdiff(condition_vars, c("drug_id", "drug_conc"))
+  samples <- meta %>%
+    filter(drug != "control") %>%
+    group_nest(across(all_of(condition_vars)), .key = "treated", keep = TRUE) %>%
+    mutate(
+      controls = pmap(
+        .,
+        function(...) {
+          d <- list(...)
+          control_filter <- d[control_vars] %>%
+            magrittr::inset2("drug_id", "control") %>%
+            imap(~identical_vec(meta[[.y]], .x)) %>%
+            reduce(magrittr::and)
+          meta %>%
+            filter(control_filter)
+        }
+      )
+    ) %>%
+    mutate(
+      samples = map2(
+        treated, controls,
+        function(treated, controls) {
+          bind_rows(
+            treated,
+            controls
+          ) %>%
+            mutate(
+              drug_conc_log = log10(drug_conc + 1),
+              condition = factor(
+                if_else(drug_id == "control", "control", "treated"),
+                levels = c("control", "treated")
+              ),
+              batch = as.factor(batch)
+            )
+        }
+      )
+    ) %>%
+    mutate(
+      design = map(
+        samples,
+        function(samples) {
+          # browser()
+          reformulate(
+            c(
+              if (concentration_method == "per_concentration") "condition" else "drug_conc_log",
+              if (length(unique(samples[["batch"]])) > 1) "batch"
+            ),
+            env = baseenv()
+          )
+        }
+      )
+    )
+}
+
+passing_meta <- samples_passing %>%
+  select(-counts) %>%
+  unnest(meta)
+
+comparisons <- crossing(
+  concentration_method = c("per_concentration", "concentration_aggregated"),
+  replicate_method = c("per_replicate", "replicates_aggregated")
+) %>%
+  mutate(
+    data = pmap(., find_comparisons, meta = passing_meta)
+  )
+  
+valid_comparisons <- comparisons %>%
+  unnest(data) %>%
+  filter(
+    # Require at least 2 controls and 2 treated samples
+    map_lgl(samples, ~all(table(.x[["condition"]]) > 1))
+  )
+```
+
+
+
+```{r format_datasets}
+
+passing_counts <- samples_passing %>%
+  pull(counts) %>%
+  map(select, sample_id, ensembl_gene_id, count) %>%
+  bind_rows()
+
+datasets_deseq <- valid_comparisons %>%
   # Prepare input meta and count table for DEseq2
   mutate(
     meta_deseq = map(
-      meta,
+      samples,
       ~.x %>%
         column_to_rownames("sample_id")
     )
   ) %>%
   mutate(
-    counts_deseq = pmap(
-      .,
-      function(meta_deseq, counts, batch, ...) {
-        # browser()
-        message(batch)
-        counts %>%
-          select(ensembl_gene_id, sample_id, count) %>%
-          filter(sample_id %in% rownames(meta_deseq)) %>%
+    counts_deseq = map(
+      samples,
+      function(samples) {
+        passing_counts %>%
+          filter(sample_id %in% samples[["sample_id"]]) %>%
           spread(sample_id, count) %>%
           mutate_at(vars(-ensembl_gene_id), replace_na, replace = 0) %>%
           column_to_rownames("ensembl_gene_id") %>%
@@ -95,8 +202,8 @@ data_sets_deseq <- samples_passing %>%
   )
 
 write_rds(
-  data_sets_deseq %>%
-    select(-counts, -meta),
+  datasets_deseq %>%
+    select(-treated, -controls),
   here("deseq", "deseq_input.rds"),
   compress = "gz"
 )
