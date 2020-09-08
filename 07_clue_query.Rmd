@@ -7,7 +7,8 @@ output: html_document
 
 ```{r setup, include=FALSE}
 library(tidyverse)
-library(genebabel)
+# library(genebabel)
+library(biomaRt)
 library(clueR)
 library(synExtra)
 library(here)
@@ -31,7 +32,7 @@ Query
 # comp_res_raw <- syn("syn21559856") %>%
 #   read_rds()
 
-comp_res_conc_raw <- syn("syn21559859") %>%
+deseq_res <- syn("syn22028260") %>%
   read_rds()
 
 signature_meta <- syn("syn21547101") %>%
@@ -43,55 +44,90 @@ pertubation_meta <- syn("syn21547097") %>%
 cmap_gene_meta <- syn("syn21547102") %>%
   read_csv()
 
+norm_drug <- function(x) {
+  x %>%
+    str_to_lower() %>%
+    str_replace_all("[^a-zA-Z0-9]", "")
+}
+
+lspci_id_name_mapping <- synapser::synGet("syn22035396", version = 3) %>%
+  chuck("path") %>%
+  read_rds() %>%
+  chuck("data", 2) %>%
+  mutate(
+    name_norm = norm_drug(name)
+  ) %>%
+  distinct()
+
+
+
 ```
 
-Only querying using highest concentration and latest time.
+```{r querying_cmap_dge}
+ensembl <- useEnsembl(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", version = "98")
 
-```{r querying_cmap}
-comp_res_selected <- comp_res_conc_raw
-  # arrange(desc(time)) %>%
-  # group_by(dataset, drug, cells, time) %>%
-  # slice(1) %>%
-  # ungroup()
+all_ensembl_ids <- deseq_res %>%
+  pull(results) %>%
+  map("ensembl_gene_id") %>%
+  reduce(union)
 
-library(genebabel)
+gene_id_mapping <- getBM(
+  c("entrezgene_id", "ensembl_gene_id"),
+  filters = "ensembl_gene_id",
+  values = all_ensembl_ids,
+  mart = ensembl
+)
 
-comp_res_entrez <- comp_res_selected %>%
-  mutate(
-    result = map(
-      result,
-      function(df) {
-        df %>%
-          {suppressWarnings(join_hgnc(., "ensembl_gene_id", "ensembl_gene_id", c("symbol", "entrez_id")))} %>%
-          dplyr::rename(gene_id = entrez_id)
-      }
-    )
+unloadNamespace("biomaRt")
+unloadNamespace("AnnotationDBI")
+
+gene_id_mapping_valid <- gene_id_mapping %>%
+  drop_na()
+
+drug_id_lspci_id_mapping <- deseq_res %>%
+  distinct(drug_id) %>%
+  left_join(
+    lspci_id_name_mapping %>%
+      distinct(lspci_id, source_collapsed, name_norm),
+    by = c("drug_id" = "name_norm")
   )
+  
 
-comp_res_gene_sets <- comp_res_entrez %>%
-  filter(
-    map_lgl(result, ~nrow(filter(.x, padj < 0.05)) > 20)
-  ) %>%
+dge_gene_sets <- deseq_res %>%
+  select(-samples, -design, -meta_deseq, -counts_deseq) %>%
   mutate(
-    gene_set = condition_conc %>%
-      str_replace_all("\\s", "_") %>%
-      str_replace_all("[^\\w]", ""),
-    result = map(
-      result,
+    gene_sets = map(
+      results,
       ~.x %>%
-        drop_na(padj) %>%
-        arrange(padj) %>%
-        filter(padj < 0.05) %>%
-        mutate(direction = if_else(log2FoldChange < 0, "down", "up"))
+        inner_join(gene_id_mapping_valid, by = "ensembl_gene_id") %>%
+        filter(padj < 0.1) %>%
+        mutate(direction = if_else(log2FoldChange > 0, "up", "down")) %>%
+        arrange(abs(log2FoldChange)) %>%
+        group_nest(direction) %>%
+        with(
+          set_names(
+            map(data, ~unique(.x[["entrezgene_id"]])),
+            direction
+          )
+        )
+    ),
+    gene_set_name = lift(paste)(
+      select(., -results) %>%
+        as.list(),
+      sep = "_"
     )
   )
+
 
 MAX_PER_QUERY = 25
-comp_res_clue <- comp_res_gene_sets %>%
+comp_res_clue <- dge_gene_sets %>%
   split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
   map(
-    ~bind_rows(set_names(.x[["result"]], .x[["gene_set"]]), .id = "gene_set") %>%
-      select(gene_set, gene_id, direction)
+    ~.x %>%
+      select(-results) %>%
+      unnest_longer(gene_sets, indices_to = "direction", values_to = "gene_id") %>%
+      unchop(gene_id) %>%
+      select(gene_set = gene_set_name, gene_id, direction)
   ) %>%
   map(
     clue_gmt_from_df,
@@ -103,7 +139,7 @@ comp_res_jobs <- comp_res_clue %>%
     ~clue_query_submit(
       .x[["up"]], .x[["down"]],
       name = paste0("dge_job_", .y),
-      use_fast_tool = FALSE
+      use_fast_tool = TRUE
     )
   )
 
@@ -116,6 +152,20 @@ comp_res_jobs <- c(
   "5eb305a7ed2e4f0011539a60"
 )
 
+failed_mask <- map(
+  comp_res_jobs,
+  clue_query_poll
+) %>%
+  map_lgl(~!identical(.x[["download_status"]], "completed"))
+
+resub_jobs <- comp_res_clue[failed_mask] %>%
+  imap(
+    ~clue_query_submit(
+      .x[["up"]], .x[["down"]],
+      name = paste0("dge_job_", .y),
+      use_fast_tool = FALSE
+    )
+  )
 
 walk(
   comp_res_jobs,
@@ -130,7 +180,6 @@ comp_res_clue_res <- map_chr(
 ```
 
 Put into synapse at syn21644366
-
 
 ```{r}
 activity <- synapser::Activity(
@@ -174,7 +223,7 @@ cmap_paths <- list(
 signatures_dge <- signature_meta %>%
   distinct() %>%
   drop_na(lspci_id) %>%
-  filter(lspci_id %in% comp_res_selected[["lspci_id"]])
+  filter(lspci_id %in% deseq_res[["drug_id"]])
 
 cmap_mats <- cmap_paths %>%
   mutate(
@@ -208,8 +257,6 @@ write_rds(
 cmap_df <- file.path(wd, "cmap_signatures_profiled.rds") %>%
   read_rds()
 ```
-
-
 
 
 ```{r querying_cmap_with_l1000}
@@ -326,7 +373,6 @@ c(
   unname(selected_signatures_dls)
 ) %>%
   synStoreMany(parentId = "syn21644366", activity = activity)
-
 ```
 
 
@@ -397,7 +443,7 @@ selected_signatures_measured_only_gene_sets <- tibble(
   group_nest(gene_set, lspci_id, cutoff)
 
 
-MAX_PER_QUERY = 25
+MAX_PER_QUERY <- 25
 selected_signatures_gmts <- selected_signatures_measured_only_gene_sets %>%
   # filter(gene_set == 1726) %>%
   filter(
@@ -555,7 +601,9 @@ walk(
 selected_signatures_dls <- selected_signatures_jobs_by_cell %>%
   map_chr(clue_query_download)
 
-new_names <- file.path(dirname(selected_signatures_dls), paste0("l1000_query_per_cell_line_", 1:length(selected_signatures_dls), ".tar.gz"))
+new_names <- file.path(
+  dirname(selected_signatures_dls), paste0("l1000_query_per_cell_line_", 1:length(selected_signatures_dls), ".tar.gz")
+)
 
 file.rename(
   selected_signatures_dls,
@@ -579,9 +627,7 @@ c(
   unname(new_names)
 ) %>%
   synStoreMany(parentId = "syn21644366", activity = activity)
-
 ```
-
 
 
 ```{r}
@@ -623,15 +669,15 @@ write_rds(
 )
 ```
 
-```{r synapse}
 
+```{r synapse}
 c(
   # file.path(wd, "cmap_signatures_profiled.rds"),
   file.path(wd, "clue_results_conc.rds")
 ) %>%
   synStoreMany(parentId = "syn21547022", activity = activity)
-
 ```
+
 
 ```{r save_gene_sets}
 all_gene_sets <- tribble(
