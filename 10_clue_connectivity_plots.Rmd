@@ -25,9 +25,11 @@ theme_set(theme_bw())
 
 
 ```{r load}
-compound_name_map <- synapser::synGet("syn21586544", version = 1) %>%
+compound_name_map <- synapser::synGet("syn22035396", version = 3) %>%
   chuck("path") %>%
-  read_csv() %>%
+  read_rds() %>%
+  filter(fp_name == "morgan_normal") %>%
+  chuck("data", 1) %>%
   distinct(
     lspci_id,
     name = str_to_lower(name)
@@ -49,6 +51,9 @@ clue_res_combined <- syn("syn21907166") %>%
   read_rds()
 
 diff_exp_by_conc <- syn("syn21559856") %>%
+  read_rds()
+
+diff_exp_linear <- syn("syn21559859") %>%
   read_rds()
 
 pertubation_meta <- syn("syn21547097") %>%
@@ -503,6 +508,14 @@ ensembl_hugo_map <- diff_exp_by_conc %>%
   reduce(union) %>%
   genebabel::query_hgnc("ensembl_gene_id")
 
+etxt <- function(s, ...) {element_text( size = s, face = "bold", ... )}
+theme_bold <- function() {
+    theme(axis.text.x = etxt(12, angle=90, hjust=1, vjust=0.5),
+          axis.text.y = etxt(12), axis.title = etxt(14),
+          legend.text = etxt(12), legend.title = etxt(14),
+          title = etxt(12))
+}
+
 calculate_dose_response_l1000 <- function(meta, signatures, z_threshold = 1.645) {
   select_signatures <- signatures %>%
     select(pr_gene_id, one_of(meta[["sig_id"]])) %>%
@@ -516,6 +529,7 @@ calculate_dose_response_l1000 <- function(meta, signatures, z_threshold = 1.645)
     inner_join(
       select(meta, sig_id, pert_dose), by = "sig_id"
     ) %>%
+    mutate(change_norm = z_score) %>%
     rename(change = z_score, drug_conc = pert_dose) %>%
     group_nest(pr_gene_id)
 }
@@ -524,21 +538,27 @@ calculate_dose_response_dge <- function(data, p_threshold = 0.05) {
   selected_signatures <- data %>%
     select(condition, result) %>%
     unnest(result) %>%
+    # mutate(log2FoldChange = log2FoldChange_MLE) %>%
+    group_by(condition) %>%
+    mutate(change_norm = scale(log2FoldChange)) %>%
+    ungroup() %>%
     group_by(ensembl_gene_id) %>%
     filter(any(na.omit(padj) <= p_threshold)) %>%
     ungroup() %>%
-    select(condition, ensembl_gene_id, log2FoldChange)
+    select(condition, ensembl_gene_id, log2FoldChange, change_norm)
   selected_signatures %>%
     inner_join(
       select(data, condition, drug_conc), by = "condition"
     ) %>%
-    drop_na(log2FoldChange) %>%
     rename(change = log2FoldChange) %>%
+    drop_na(change) %>%
     group_nest(ensembl_gene_id)
 }
 
 calculate_dose_response <- function(drug, cell, time, p_threshold = 0.05, method = "spearman", round_digits = 1) {
+  # browser()
   l1000 <- signature_meta %>%
+    distinct() %>%
     filter(lspci_id == drug, cell_id == cell, if (!is.null(time)) pert_time == time else TRUE) %>%
     select_if(negate(is.list)) %>%
     calculate_dose_response_l1000(cmap_signatures_profiled, z_threshold = qnorm(1 - p_threshold)) %>%
@@ -597,15 +617,29 @@ dose_response_pairwise_fisher <- function(df) {
 }
 
 dose_response_curve <- function(df) {
+  scale_factor <- df %>%
+    group_by(method) %>%
+    summarize(max_val = max(abs(change))) %>%
+    ungroup() %>%
+    spread(method, max_val) %>%
+    {.[["l1000"]]/.[["dge"]]}
   df %>%
-    ggplot(aes(drug_conc, change, color = method)) +
-    geom_point() +
-    geom_smooth(aes(fill = method, group = method)) +
+    mutate(
+      change_scaled = if_else(method == "dge", change*scale_factor, change)
+    ) %>%
+    # ggplot(aes(drug_conc, change_norm, color = method)) +
+    ggplot(aes(drug_conc, change_scaled, color = method)) +
+    geom_hline(yintercept = 0, color = "grey30") +
+    geom_point(alpha = 0.5) +
+    scale_y_continuous(
+      sec.axis = sec_axis(~./scale_factor, name = "DGE")
+    ) +
+    geom_smooth(aes(fill = method, group = method), method = "lm", alpha = 0.2) +
     scale_x_log10() +
-    labs(x = "Dose (uM)", y = "Expression change (z-score)")
+    labs(x = "Dose (uM)", y = "L1000")
 }
 
-dose_response_cor_and_curves <- function(df, seed = 42) {
+dose_response_cor_and_curves <- function(df, seed = 42, highlighted_genes = NULL) {
   set.seed(seed)
   dose_cor_plot_data <- dose_response_pairwise(df) %>%
     mutate(
@@ -619,8 +653,10 @@ dose_response_cor_and_curves <- function(df, seed = 42) {
     ) %>%
     group_by(pos) %>%
     mutate(
-      selected = if(unique(pos) == "no")
+      selected = if (unique(pos) == "no")
         "no"
+      else if (!is.null(highlighted_genes))
+        if_else(symbol %in% highlighted_genes, pos, "no")
       else
         sample(c(rep_len("no", n() - 1), unique(pos)), n())
     ) %>%
@@ -635,11 +671,48 @@ dose_response_cor_and_curves <- function(df, seed = 42) {
     ggplot(aes(dge, l1000, color = color_selected)) +
     geom_hline(yintercept = c(-0.25, 0.25), color = "grey30") +
     geom_vline(xintercept = c(-0.25, 0.25), color = "grey30") +
-    geom_point(alpha = 0.8) +
+    annotation_custom(
+      grid::rectGrob(gp = grid::gpar(fill = "yellow", alpha = 0.2)),
+      xmin = -1, xmax = -0.25, ymin = -1, ymax = -0.25
+    ) +
+    annotation_custom(
+      grid::rectGrob(gp = grid::gpar(fill = "yellow", alpha = 0.2)),
+      xmin = 0.25, xmax = 1, ymin = 0.25, ymax = 1
+    ) +
+    annotation_custom(
+      grid::rectGrob(gp = grid::gpar(fill = "magenta", alpha = 0.2)),
+      xmin = -0.25, xmax = 0.25, ymin = 0.25, ymax = 1
+    ) +
+    annotation_custom(
+      grid::rectGrob(gp = grid::gpar(fill = "magenta", alpha = 0.2)),
+      xmin = -0.25, xmax = 0.25, ymin = -1, ymax = -0.25
+    ) +
+      annotation_custom(
+      grid::rectGrob(gp = grid::gpar(fill = "cyan", alpha = 0.2)),
+      xmin = -1, xmax = -0.25, ymin = -0.25, ymax = 0.25
+    ) +
+    annotation_custom(
+      grid::rectGrob(gp = grid::gpar(fill = "cyan", alpha = 0.2)),
+      xmin = 0.25, xmax = 1, ymin = -0.25, ymax = 0.25
+    ) +
+    coord_cartesian(expand = FALSE) +
+    geom_point(aes(size = selected), alpha = 0.8) +
+    scale_size_manual(
+      values = c("no" = 2, "left_middle" = 3, "left_bottom" = 3, "right_middle" = 3, "right_top" = 3),
+      guide = FALSE
+    ) +
+    geom_text_repel(
+      aes(label = symbol),
+      data = ~.x %>%
+        mutate(symbol = if_else(selected == "no", "", symbol)),
+      # box.padding = 0.5,
+      # point.padding = 0.5,
+      max.iter = 8000
+    ) +
     coord_equal(xlim = c(-1, 1), ylim = c(-1, 1)) +
     scale_color_identity() +
     guides(color = FALSE) +
-    labs()
+    labs(x = "Dose-response correlation DGE", y = "Dose-respose correlation L1000")
   dose_plots <- df %>%
     inner_join(
       dose_cor_plot_data %>%
@@ -656,18 +729,28 @@ dose_response_cor_and_curves <- function(df, seed = 42) {
     {set_names(.[["plot"]], .[["pos"]])}
   arrangeGrob(
     grobs = list(
-      cor_plot,
-      dose_plots[["left_middle"]],
-      dose_plots[["left_bottom"]],
+      cor_plot +
+        labs(title = "Palbociclib dose-response correlation"),
+      dose_plots[["left_middle"]] +
+        theme(legend.position = "none"),
+      dose_plots[["left_bottom"]] +
+        theme(legend.position = "none"),
       dose_plots[["right_middle"]],
       dose_plots[["right_top"]]
-    ),
+    ) %>%
+      map(~.x + theme_bold()) %>%
+      c(
+        list(
+          grid::nullGrob(),
+          grid::nullGrob()
+        )
+      ),
     layout_matrix = rbind(
-      c(2, 1, 5),
-      c(3, 1, 4)
+      c(2, 6, 1, 7, 5),
+      c(3, 6, 1, 7, 4)
     ),
-    widths = unit(c(3, 4, 3), "in"),
-    heights = unit(c(2, 2), "in")
+    widths = unit(c(4, 0.1, 6, 0.1, 5), "in"),
+    heights = unit(c(3, 3), "in")
   )
 }
 
@@ -677,9 +760,20 @@ palbo_dose_cor <- calculate_dose_response(
   "MCF7", time = 24
 )
 
-palbo_dose_cor_plot <- dose_response_cor_and_curves(palbo_dose_cor, seed = 1)
+picked_genes <- c(
+  "FAM20B", "VPS28", "EGR1", "HPRT1"
+)
+
+palbo_dose_cor_plot <- dose_response_cor_and_curves(
+  palbo_dose_cor, seed = 1, highlighted_genes = picked_genes
+)
 
 grid::grid.draw(palbo_dose_cor_plot)
+
+ggsave(
+  file.path(wd, "palbo_dose_cor_plot.png"),
+  palbo_dose_cor_plot, width = 15.5, height = 6
+)
 
 palbo_dose_cor_plot_data <- dose_response_pairwise(palbo_dose_cor)
 
