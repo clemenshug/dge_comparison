@@ -128,13 +128,12 @@ submitJobs(
     memory = "10gb",
     ncpus = 1L,
     partition = "short",
-    walltime = 20*60,
+    walltime = 30*60,
     chunks.as.arrayjobs = TRUE,
     # For some reason these nodes fail to execute R because of an "illegal instruction"
     exclude = "compute-f-17-[09-25]"
   )
 )
-
 
 deseq_results <- chunked_deseq_input %>%
   ungroup() %>%
@@ -154,18 +153,6 @@ deseq_results <- chunked_deseq_input %>%
   pull(data) %>%
   bind_rows()
 
-# x <- deseq_results %>%
-#   mutate(
-#     results = map2(
-#       results, concentration_method,
-#       function(results, concentration_method)  {
-#         if (concentration_method == "concentration_aggregated")
-#           return(results)
-#         results %>%
-#           mutate(across(starts_with("log2"), ~.x*-1))
-#       }
-#     )
-#   )
 
 write_rds(
   deseq_results,
