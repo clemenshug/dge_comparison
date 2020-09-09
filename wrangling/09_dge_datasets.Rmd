@@ -105,6 +105,7 @@ jsm_meta_raw <- syn("syn21541012") %>%
 jsm_meta <- jsm_meta_raw %>%
   transmute(
     plate = 1,
+    replicate = 1,
     well = str_replace(Well, "^([A-Z])([1-9])$", "\\10\\2"),
     cells = Cells,
     stim = recode(Stim, "0" = "control"),
@@ -114,8 +115,7 @@ jsm_meta <- jsm_meta_raw %>%
       Drug,
       "0" = "control",
       "5Z-7-Oxozeanol" = "5Z-7-Oxozeaenol",
-      "Nec-1s" = "CHEMBL381230",
-      
+      "Nec-1s" = "CHEMBL381230"
     ),
     drug_conc = `DrugConc(inuM)`
   )
@@ -131,6 +131,7 @@ cdk_old_meta_raw <- synapser::synGet("syn21542403", followLink = TRUE) %>%
 cdk_old_meta <- cdk_old_meta_raw %>%
   transmute(
     plate = 1,
+    replicate = 1,
     well,
     cells = cell_line,
     drug = recode(drug, "DMSO" = "control"),
@@ -148,6 +149,7 @@ cdk_new_meta <- cdk_new_meta_raw %>%
   drop_na(cell_line) %>%
   transmute(
     plate,
+    replicate = plate,
     well,
     cells = cell_line,
     drug  = recode(agent, "DMSO" = "control"),
@@ -165,6 +167,7 @@ ld_dub_raw <- synapser::synGet("syn21542711", followLink = TRUE) %>%
 ld_dub_meta <- ld_dub_raw %>%
   transmute(
     plate = 1,
+    replicate = 1,
     well,
     cells = cellline,
     drug = recode(
@@ -191,6 +194,7 @@ sr_repurposing_meta_raw2 <- synapser::synGet("syn21547000", followLink = TRUE) %
 sr_repurposing_meta1 <- sr_repurposing_meta_raw1 %>%
   transmute(
     plate = 1,
+    replicate = 1,
     well = Well,
     cells = "rencell",
     drug = recode(Drug, "Drug control" = "control"),
@@ -201,6 +205,7 @@ sr_repurposing_meta1 <- sr_repurposing_meta_raw1 %>%
 sr_repurposing_meta2 <- sr_repurposing_meta_raw2 %>%
   transmute(
     plate = 1,
+    replicate = 1,
     well = Well,
     cells = "rencell",
     drug = recode(Drug, "DMSO" = "control"),
@@ -221,6 +226,28 @@ sr_repurposing_meta2 <- sr_repurposing_meta_raw2 %>%
 ```
 
 
+
+```{r fp_transdiff_screen_meta}
+fp_transdiff_meta_raw <- synapser::synGet("syn22005605", followLink = TRUE) %>%
+  chuck("path") %>%
+  read_csv()
+
+fp_transdiff_meta <- fp_transdiff_meta_raw %>%
+  gather("column", "drug", -row) %>%
+  transmute(
+    # Add leading zero to column number
+    well = paste0(row, sprintf("%02d", as.integer(column))),
+    drug = recode(drug, DMSO = "control"),
+    cells = "mouse_embryonic_fibroblasts",
+    # Exact concentration unknown...
+    drug_conc = if_else(drug != "control", 1, 0),
+    replicate = 1
+  ) %>%
+  # Experiment contains 4 identical plates
+  crossing(plate = 1:4)
+```
+
+
 ```{r counts}
 dataset_syn <- tribble(
   ~dataset, ~folder_syn, ~date,
@@ -229,25 +256,27 @@ dataset_syn <- tribble(
   "ld_dub", "syn21541471", "2018_06",
   "lincs_cdk4_6_7", "syn21541479", "2019_08",
   "sr_repurposing", "syn21548149", "2018_02",
-  "sr_repurposing", "syn21548150", "2018_11"
+  "sr_repurposing", "syn21548150", "2018_11",
+  "fp_transdiff", "syn22041289", "2015_10"
 ) %>%
   mutate(
     files = map(
       folder_syn,
       function(x) {
         folder_content = synChildren(x)
-        cm_match <- str_match(names(folder_content), "^(?:(.*[0-9]+)|tagcounts)\\.mtx$")
+        cm_match <- str_match(names(folder_content), "^(?:(.*([0-9]+))|tagcounts)\\.mtx$")
         cm_hit <- !is.na(cm_match[, 1])
         # browser()
         if (sum(cm_hit) > 1) {
-          plate_idx <- cm_match[, 2][cm_hit]
+          plate_idx <- cm_match[, 3][cm_hit]
+          file_prefix <- cm_match[, 2][cm_hit]
           tibble(
             plate = plate_idx,
             counts = folder_content[cm_hit],
-            count_dupes = folder_content[paste0(plate_idx, "-dupes.mtx")],
-            colnames = folder_content[paste0(plate_idx, ".mtx.colnames")],
-            rownames = folder_content[paste0(plate_idx, ".mtx.rownames")],
-            barcode_counts = folder_content[paste0(plate_idx, "-barcodes.tsv")]
+            count_dupes = folder_content[paste0(file_prefix, "-dupes.mtx")],
+            colnames = folder_content[paste0(file_prefix, ".mtx.colnames")],
+            rownames = folder_content[paste0(file_prefix, ".mtx.rownames")],
+            barcode_counts = folder_content[paste0(file_prefix, "-barcodes.tsv")]
           )
         } else {
           tibble(
@@ -312,6 +341,7 @@ ensembl_gene_id_mapping_biomart <- biomaRt::select(
 ) %>%
   as_tibble() %>%
   filter(gene_biotype == "protein_coding") %>%
+  # Replace empty symbols with NA
   mutate(hgnc_symbol = magrittr::inset(hgnc_symbol, hgnc_symbol == "", NA_character_)) %>%
   rename(symbol = hgnc_symbol) %>%
   select(-gene_biotype) %>%
@@ -342,6 +372,7 @@ datasets_counts <- datasets_raw %>%
     barcode_counts = barcode_counts %>%
       map(drop_na, well)
   )
+
 ```
 
 
@@ -354,6 +385,7 @@ meta_all <- tribble(
   "lincs_cdk4_6_7", cdk_new_meta, "2019_08",
   "sr_repurposing", sr_repurposing_meta1, "2018_02",
   "sr_repurposing", sr_repurposing_meta2, "2018_11",
+  "fp_transdiff", fp_transdiff_meta, "2015_10"
 ) %>%
   unnest(meta) %>%
   mutate(
@@ -362,33 +394,70 @@ meta_all <- tribble(
     batch = paste(dataset, date, plate, sep = "_"),
   )
 
-cmpd_name_map <- syn("syn21586544") %>%
-  read_csv()
+drug_name_mapping <-  syn("syn22035396") %>%
+  read_rds() %>%
+  filter(fp_name == "morgan_normal") %>%
+  chuck("data", 1)
 
-cmpd_name_map_norm <- cmpd_name_map %>%
-  distinct(
+drug_name_mapping_norm <- drug_name_mapping %>%
+  transmute(
     lspci_id,
     name,
-    name_norm = norm_drug(name)
-  ) %>%
+    name_norm = norm_drug(name),
+    source_collapsed
+  )
+
   # Barasertib appears twice in Chembl (CHEMBL415049 and CHEMBL215152)
   # CHEMBL215152 is most likely a mistake
   # keeping only CHEMBL415049 (lspci_id 102882), discarding CHEMBL215152 (lspci_id 100354)
-  filter(lspci_id != 100354)
+  # Same thing with IMD-0453 and omeprazole
+  # Pifithrin-mu in this case not what was used, pifithrin-alpha
+  # Piceantannol has weird secondary naming in 90990, primary is in 2676
+  # NPS 2143 is misannotated at one vendor
+  # Candesartan was used, not Candesartan cilexetil
+  # AP26113 misannotated at chembl with alt name
+  # Tolfenamic acid misannotated at vendor
+  # AT101 misannoated at ChEMBL with alt name
+  # NLG919 misannotated at vendor
+  # PYR41 misannoated at vendor
+  # filter(
+  #   !lspci_id %in% c(100354, 1443860, 149325, 634201, 80990, 392021, 87456, 1444031, 1100176, 107269, 115787, 1207732)
+  # )
 
 cmdps_mapped <- meta_all %>%
   distinct(
     drug,
     drug_norm
   ) %>%
+  mutate(
+    drug_all = map(
+      drug_norm,
+      ~str_match(.x, "\\s\\((.+)\\)$")[, 2] %>%
+        str_split(",\\s?") %>%
+        c(.x) %>%
+        unlist() %>%
+        na.omit()
+    )
+  ) %>%
+  unchop(drug_all) %>%
+  distinct() %>%
   left_join(
-    cmpd_name_map_norm,
-    by = c("drug_norm" = "name_norm")
+    distinct(drug_name_mapping_norm, lspci_id, name, name_norm, source_collapsed),
+    by = c("drug_all" = "name_norm")
   )
+
+cmdps_mapped_unique <- cmdps_mapped %>%
+  group_by(drug_norm) %>%
+  arrange(source_collapsed, .by_group = TRUE) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  distinct(lspci_id, drug_name = drug, drug_norm)
+
+condition_vars <- c("cells", "stim", "stim_conc", "drug_id", "drug_conc", "time")
 
 meta_cmpd_mapped <- meta_all %>%
   left_join(
-    distinct(cmdps_mapped, drug_norm, lspci_id),
+    cmdps_mapped_unique,
     by = "drug_norm"
   ) %>%
   mutate(
@@ -398,21 +467,10 @@ meta_cmpd_mapped <- meta_all %>%
   mutate(
     condition = exec(
       paste,
-      !!!as.list(.)[c("cells", "stim", "stim_conc", "drug_id", "drug_conc", "time")],
+      !!!as.list(.)[condition_vars],
       sep = "_"
     ),
-    sample_id = paste(batch, well, condition, sep = "_"),
-    # Matching each sample with it's control condition
-    # This is the sample which has the same cell line, stimulus and time point
-    # and drug == "control"
-    control_condition = exec(
-      paste,
-      !!!as.list(.)[c("cells", "stim", "stim_conc", "drug_id", "drug_conc", "time")] %>%
-        magrittr::inset2("drug_id", "control") %>%
-        magrittr::inset2("drug_conc", 0) %>%
-        magrittr::inset2("sep", "_")
-    ) %>%
-      magrittr::inset(!(. %in% condition), NA_character_)
+    sample_id = paste(batch, well, condition, sep = "_")
   ) %>%
   group_nest(dataset, date, plate, batch, .key = "meta")
 
@@ -451,6 +509,7 @@ dataset_names <- tribble(
   "lincs_cdk4_6_7", "2019_08_lincs_cdk4_6_7_inhibitors", "2019_08",
   "sr_repurposing", "2018_02_steven_rodriguez_ad_repurposing", "2018_02",
   "sr_repurposing", "2018_11_steven_rodriguez_ad_repurposing", "2018_11",
+  "fp_transdiff", "2015_10_feodor_price_transdifferentiation_screen", "2015_10"
 ) %>%
   mutate(
     dataset_name = as.factor(dataset_name) %>%
@@ -484,7 +543,7 @@ activity <- synapser::Activity(
 
 c(
   file.path(wd, "counts_raw.rds"),
-  file.path(wd, "dataset_names.csv"),
+  file.path(wd, "dataset_names.csv"), 
   file.path(wd, "meta_mapped.rds")
 ) %>%
   synStoreMany(parentId = "syn21542764", activity = activity)

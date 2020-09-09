@@ -84,10 +84,12 @@ identical_vec <- function(vec, val) {
 }
 
 find_comparisons <- function(meta, concentration_method, replicate_method) {
-  condition_vars <- c("cells", "stim", "stim_conc", "drug_id", "time")
+  drug_vars <- c("drug", "drug_norm", "drug_id", "drug_name", "lspci_id")
+  exp_vars <- c("cells", "stim", "stim_conc", "time")
+  condition_vars <- c(drug_vars, exp_vars)
   condition_vars <- switch(
     replicate_method,
-    per_replicate = union(condition_vars, c("dataset", "replicate")),
+    per_replicate = c(condition_vars, c("dataset", "replicate")),
     replicates_aggregated = condition_vars
   )
   condition_vars <- switch(
@@ -95,7 +97,7 @@ find_comparisons <- function(meta, concentration_method, replicate_method) {
     per_concentration = union(condition_vars, c("drug_conc")),
     concentration_aggregated = condition_vars
   )
-  control_vars <- setdiff(condition_vars, c("drug_id", "drug_conc"))
+  control_vars <- setdiff(condition_vars, c(drug_vars, "drug_conc"))
   samples <- meta %>%
     filter(drug != "control") %>%
     group_nest(across(all_of(condition_vars)), .key = "treated", keep = TRUE) %>%
@@ -160,7 +162,7 @@ comparisons <- crossing(
   mutate(
     data = pmap(., find_comparisons, meta = passing_meta)
   )
-  
+
 valid_comparisons <- comparisons %>%
   unnest(data) %>%
   filter(
@@ -178,6 +180,11 @@ passing_counts <- samples_passing %>%
   map(select, sample_id, ensembl_gene_id, count) %>%
   bind_rows()
 
+all_counts_mat <- passing_counts %>%
+  spread(sample_id, count, fill = 0) %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+
 datasets_deseq <- valid_comparisons %>%
   # Prepare input meta and count table for DEseq2
   mutate(
@@ -191,12 +198,7 @@ datasets_deseq <- valid_comparisons %>%
     counts_deseq = map(
       samples,
       function(samples) {
-        passing_counts %>%
-          filter(sample_id %in% samples[["sample_id"]]) %>%
-          spread(sample_id, count) %>%
-          mutate_at(vars(-ensembl_gene_id), replace_na, replace = 0) %>%
-          column_to_rownames("ensembl_gene_id") %>%
-          as.matrix()
+        all_counts_mat[, samples[["sample_id"]]]
       }
     )
   )
@@ -207,8 +209,8 @@ write_rds(
   here("deseq", "deseq_input.rds"),
   compress = "gz"
 )
-```
 
+```
 
 
 ```{r synapse}
