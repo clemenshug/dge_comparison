@@ -1,0 +1,404 @@
+---
+title: "Investigate novel drugs"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(synExtra)
+library(tidyverse)
+library(cmapR)
+library(here)
+library(egg)
+library(broom)
+library(ggrepel)
+library(seriation)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("data")
+
+wd <- here("clue_query")
+dir.create(wd, showWarnings = FALSE)
+
+theme_set(theme_bw())
+```
+
+
+
+
+```{r load}
+compound_name_map <- syn("syn22035396.3") %>%
+  read_rds() %>%
+  filter(fp_name == "morgan_normal") %>%
+  chuck("data", 1)
+
+cmap_gene_meta <- syn("syn21547102") %>%
+  read_csv()
+
+clue_res_dge <- syn("syn21907139") %>%
+  read_rds()
+
+clue_res_l1000 <- syn("syn21907143") %>%
+  read_rds()
+
+clue_res_combined <- syn("syn21907166.4") %>%
+  read_rds()
+# clue_res_combined_2 <- clue_res_combined
+
+pertubation_meta <- syn("syn21547097.6") %>%
+  read_csv()
+
+signature_meta <- syn("syn21547101.6") %>%
+  read_csv()
+
+dge_meta <- syn("syn22000707.8") %>%
+  read_rds()
+
+deseq_res <- syn("syn22017733.1") %>%
+  read_rds()
+
+deseq_meta <- syn("syn21558154.4") %>%
+  read_rds()
+
+```
+
+```{r sr_drug_repurposing}
+## Load all results
+R <- clue_res_combined %>%
+    filter( result_type == "pcl", score_level == "summary" ) %>%
+    pluck( "data", 1 )
+
+## Identify relevant gene sets
+dubs <- deseq_res %>%
+  mutate(
+    gene_set = condition_conc %>%
+      str_replace_all("\\s", "_") %>%
+      str_replace_all("[^\\w]", "")
+  ) %>%
+  semi_join(
+    dge_meta %>%
+        unnest(meta) %>%
+        filter(dataset == "sr_repurposing", !lspci_id %in% signature_meta$lspci_id, is.na(stim)) %>%
+        group_by(drug_id) %>%
+        arrange(desc(time)) %>%
+        slice(1),
+    by = c("cells", "drug_id", "time", "stim")
+  )
+
+x <- compound_name_map %>%
+  group_by(lspci_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(lspci_id, name)
+
+## Isolate the appropriate slice of data
+## Aggregate across multiple entries to compute master similarity score
+R2 <- R %>%
+  drop_na(tau) %>%
+  # filter(pert_type == "trt_cp") %>%
+  inner_join(
+    dubs %>%
+      distinct(gene_set, drug_id),
+    by = "gene_set"
+  ) %>%
+  rename(pert_iname = id) %>%
+  # inner_join(
+  #   x,
+  #   by = c("lspci_id_query" = "lspci_id")
+  # ) %>%
+  group_by( pert_iname, name_query, source, z_score_cutoff ) %>%
+  summarize_at( "tau", ~.x[ which.max(abs(.x)) ] ) %>%
+  ungroup() %>%
+  mutate_at( "source", toupper )
+
+# FInd most similar drugs per query
+
+R3 <- R2 %>%
+  filter(
+    pert_iname %in% {
+      group_by(., name_query) %>%
+        arrange(desc(tau), .by_group = TRUE) %>%
+        slice(1:5) %>%
+        ungroup() %>%
+        pull(pert_iname)
+    }
+  )
+
+## Perform hierarchical clustering on drugT profiles (columns in the final plot)
+## Use the DGE slice because it is cleaner and less saturated
+DM <- R3 %>% filter( source == "DGE" ) %>% select( name_query, pert_iname, tau ) %>%
+    spread( name_query, tau ) %>% as.data.frame %>% column_to_rownames("pert_iname")
+comp_order <- function(m) {
+  dm <- dist(m)
+  hclust(dm) %>% reorder(dm) %>%  dendextend::order.hclust() %>% labels(dm)[.]
+}
+lvl <- comp_order(DM)
+lvl2 <- comp_order(t(DM))
+
+## Fix the order via factor levels
+R3 <- R3 %>% mutate(name_query = factor(name_query, lvl2),
+                    pert_iname = factor(pert_iname, lvl))
+
+# # Complete missing observations at z-scores that yielded insufficient
+# # genes for Clue with NA
+# R2_completed <- bind_rows(
+#     R2 %>%
+#         filter(source == "DGE"),
+#     R2 %>%
+#         filter(source == "L1000") %>%
+#         complete(nesting(idQ, idT, source, drugT, drugQ), z_score_cutoff)
+# )
+
+## Plotting elements
+pal <- rev(RColorBrewer::brewer.pal(n=7, name="RdBu"))
+etxt <- function(s, ...) {element_text( size = s, face = "bold", ... )}
+theme_bold <- function() {
+    theme(axis.text.x = etxt(12, angle=90, hjust=1, vjust=0.5),
+          axis.text.y = etxt(12), axis.title = etxt(14),
+          legend.text = etxt(12), legend.title = etxt(14),
+          axis.ticks = element_blank())
+}
+
+## Plotting a heatmap of clue hits
+fplot <- function(X) {
+    ggplot( X, aes(x=name_query, y=pert_iname, fill=tau) ) +
+        theme_minimal() + theme_bold() +
+        geom_tile(color="black") +
+        # geom_tile(data=filter(X, idQ==idT), color="black", size=1) +
+        scale_fill_gradientn( colors=pal, limits=c(-100,100) ) +
+        labs(x = "Drug query", y = "Clue target class", fill = "Tau" )
+}
+
+ggsave(
+  file.path(wd, "sr_repurposing_unknown_drugs_pcl.png"),
+  fplot(R3),
+  width = 8, height = 10
+)
+```
+
+```{r dubs}
+
+
+## Identify relevant gene sets
+dubs <- deseq_res %>%
+  mutate(
+    gene_set = condition_conc %>%
+      str_replace_all("\\s", "_") %>%
+      str_replace_all("[^\\w]", "")
+  ) %>%
+  semi_join(
+    dge_meta %>%
+        unnest(meta) %>%
+        filter(dataset == "ld_dub", !lspci_id %in% signature_meta$lspci_id, is.na(stim)) %>%
+        group_by(drug_id) %>%
+        arrange(desc(time)) %>%
+        slice(1),
+    by = c("cells", "drug_id", "time", "stim")
+  )
+
+## Isolate the appropriate slice of data
+## Aggregate across multiple entries to compute master similarity score
+R2 <- R %>%
+  drop_na(tau) %>%
+  # filter(pert_type == "trt_cp") %>%
+  inner_join(
+    dubs %>%
+      distinct(gene_set, drug_id),
+    by = "gene_set"
+  ) %>%
+  dplyr::rename(pert_iname = id) %>%
+  group_by( pert_iname, name_query, source, z_score_cutoff ) %>%
+  summarize_at( "tau", ~.x[ which.max(abs(.x)) ] ) %>%
+  ungroup() %>%
+  mutate_at( "source", toupper )
+
+# FInd most similar drugs per query
+
+R3 <- R2 %>%
+  dplyr::filter(
+    pert_iname %in% {
+      group_by(R2, name_query) %>%
+        arrange(desc(tau), .by_group = TRUE) %>%
+        slice(1:5) %>%
+        ungroup() %>%
+        pull(pert_iname)
+    }
+  )
+
+
+## Perform hierarchical clustering on drugT profiles (columns in the final plot)
+## Use the DGE slice because it is cleaner and less saturated
+DM <- R3 %>% filter( source == "DGE" ) %>% select( name_query, pert_iname, tau ) %>%
+    spread( name_query, tau ) %>% as.data.frame %>% column_to_rownames("pert_iname")
+comp_order <- function(m) {
+  dm <- dist(m)
+  hclust(dm) %>% reorder(dm) %>%  dendextend::order.hclust() %>% labels(dm)[.]
+}
+lvl <- comp_order(DM)
+lvl2 <- comp_order(t(DM))
+
+## Fix the order via factor levels
+R3 <- R3 %>% mutate(name_query = factor(name_query, lvl2),
+                    pert_iname = factor(pert_iname, lvl))
+
+# # Complete missing observations at z-scores that yielded insufficient
+# # genes for Clue with NA
+# R2_completed <- bind_rows(
+#     R2 %>%
+#         filter(source == "DGE"),
+#     R2 %>%
+#         filter(source == "L1000") %>%
+#         complete(nesting(idQ, idT, source, drugT, drugQ), z_score_cutoff)
+# )
+
+## Plotting elements
+pal <- rev(RColorBrewer::brewer.pal(n=7, name="RdBu"))
+etxt <- function(s, ...) {element_text( size = s, face = "bold", ... )}
+theme_bold <- function() {
+    theme(axis.text.x = etxt(12, angle=90, hjust=1, vjust=0.5),
+          axis.text.y = etxt(12), axis.title = etxt(14),
+          legend.text = etxt(12), legend.title = etxt(14),
+          axis.ticks = element_blank())
+}
+
+## Plotting a heatmap of clue hits
+fplot <- function(X) {
+    ggplot( X, aes(x=name_query, y=pert_iname, fill=tau) ) +
+        theme_minimal() + theme_bold() +
+        geom_tile(color="black") +
+        # geom_tile(data=filter(X, idQ==idT), color="black", size=1) +
+        scale_fill_gradientn( colors=pal, limits=c(-100,100) ) +
+        labs(x = "Drug query", y = "Clue target class", fill = "Tau" )
+}
+
+ggsave(
+  file.path(wd, "sr_repurposing_unknown_drugs_pcl.png"),
+  fplot(R3),
+  width = 8, height = 10
+)
+```
+
+
+```{r combined_heatmaps}
+
+
+## Identify relevant gene sets
+dubs <- deseq_res %>%
+  mutate(
+    gene_set = condition_conc %>%
+      str_replace_all("\\s", "_") %>%
+      str_replace_all("[^\\w]", "")
+  ) %>%
+  inner_join(
+    dge_meta %>%
+        unnest(meta) %>%
+        filter(
+          dataset %in% c("sr_repurposing", "ld_dub"),
+          !lspci_id %in% signature_meta$lspci_id, is.na(stim)
+        ) %>%
+        group_by(drug_id) %>%
+        arrange(desc(time)) %>%
+        slice(1) %>%
+        select(cells, drug_id, time, stim, dataset),
+    by = c("cells", "drug_id", "time", "stim")
+  )
+
+## Isolate the appropriate slice of data
+## Aggregate across multiple entries to compute master similarity score
+R2 <- R %>%
+  drop_na(tau) %>%
+  # filter(pert_type == "trt_cp") %>%
+  inner_join(
+    dubs %>%
+      distinct(gene_set, drug_id, dataset),
+    by = "gene_set"
+  ) %>%
+  dplyr::rename(pert_iname = id) %>%
+  group_by( pert_iname, name_query, source, z_score_cutoff, dataset ) %>%
+  summarize_at( "tau", ~.x[ which.max(abs(.x)) ] ) %>%
+  ungroup() %>%
+  mutate_at( "source", toupper )
+
+# FInd most similar drugs per query
+
+R3 <- R2 %>%
+  dplyr::filter(
+    pert_iname %in% {
+      group_by(R2, name_query) %>%
+        arrange(desc(tau), .by_group = TRUE) %>%
+        slice(1:5) %>%
+        ungroup() %>%
+        pull(pert_iname)
+    }
+  )
+
+
+## Perform hierarchical clustering on drugT profiles (columns in the final plot)
+## Use the DGE slice because it is cleaner and less saturated
+DM <- R3 %>% filter( source == "DGE" ) %>% select( name_query, pert_iname, tau ) %>%
+    spread( name_query, tau ) %>% as.data.frame %>% column_to_rownames("pert_iname")
+comp_order <- function(m) {
+  dm <- dist(m)
+  hclust(dm) %>% reorder(dm) %>%  dendextend::order.hclust() %>% labels(dm)[.]
+}
+lvl <- comp_order(DM)
+lvl2 <- R2 %>%
+  filter( source == "DGE" ) %>%
+  distinct(name_query, dataset) %>%
+  group_by(dataset) %>%
+  group_map(
+    ~DM[, unique(.x[["name_query"]])] %>%
+      t() %>%
+      comp_order()
+  ) %>%
+  {c(.[[2]], "", .[[1]])}
+
+## Fix the order via factor levels
+R3 <- R3 %>%
+  bind_rows(
+    tibble(
+      name_query = "",
+      pert_iname = unique(.[["pert_iname"]]),
+      tau = NA_real_
+    )
+  ) %>%
+  mutate(name_query = factor(name_query, lvl2),
+                    pert_iname = factor(pert_iname, lvl))
+
+# # Complete missing observations at z-scores that yielded insufficient
+# # genes for Clue with NA
+# R2_completed <- bind_rows(
+#     R2 %>%
+#         filter(source == "DGE"),
+#     R2 %>%
+#         filter(source == "L1000") %>%
+#         complete(nesting(idQ, idT, source, drugT, drugQ), z_score_cutoff)
+# )
+
+## Plotting elements
+pal <- rev(RColorBrewer::brewer.pal(n=7, name="RdBu"))
+etxt <- function(s, ...) {element_text( size = s, face = "bold", ... )}
+theme_bold <- function() {
+    theme(axis.text.x = etxt(12, angle=90, hjust=1, vjust=0.5),
+          axis.text.y = etxt(12), axis.title = etxt(14),
+          legend.text = etxt(12), legend.title = etxt(14),
+          axis.ticks = element_blank())
+}
+
+## Plotting a heatmap of clue hits
+fplot <- function(X) {
+    ggplot( X, aes(x=name_query, y=pert_iname, fill=tau) ) +
+        theme_minimal() + theme_bold() +
+        geom_tile(color="black") +
+        # geom_tile(data=filter(X, idQ==idT), color="black", size=1) +
+        scale_fill_gradientn( colors=pal, limits=c(-100,100), na.value = "white" ) +
+        labs(x = "Drug query", y = "Clue target class", fill = "Tau" )
+}
+
+ggsave(
+  file.path(wd, "dub_sr_repurposing_unknown_drugs_pcl.png"),
+  fplot(R3),
+  width = 9, height = 10
+)
+```
+
+
