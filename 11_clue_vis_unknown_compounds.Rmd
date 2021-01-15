@@ -402,3 +402,204 @@ ggsave(
 ```
 
 
+
+```{r dub_ad_repurposing_genetic_pertubations}
+R <- clue_res_combined %>%
+    filter( result_type == "pert", score_level == "summary" ) %>%
+    pluck( "data", 1 )
+
+
+## Identify relevant gene sets
+dubs <- deseq_res %>%
+  mutate(
+    gene_set = condition_conc %>%
+      str_replace_all("\\s", "_") %>%
+      str_replace_all("[^\\w]", "")
+  ) %>%
+  inner_join(
+    dge_meta %>%
+        unnest(meta) %>%
+        filter(
+          dataset %in% c("sr_repurposing", "ld_dub"),
+          !lspci_id %in% signature_meta$lspci_id, is.na(stim)
+        ) %>%
+        group_by(drug_id) %>%
+        arrange(desc(time)) %>%
+        slice(1) %>%
+        select(cells, drug_id, time, stim, dataset),
+    by = c("cells", "drug_id", "time", "stim")
+  )
+
+## Isolate the appropriate slice of data
+## Aggregate across multiple entries to compute master similarity score
+R2 <- R %>%
+  drop_na(tau) %>%
+  # filter(pert_type == "trt_cp") %>%
+  inner_join(
+    dubs %>%
+      distinct(gene_set, drug_id, dataset),
+    by = "gene_set"
+  ) %>%
+  # dplyr::rename(pert_iname = id) %>%
+  group_by( pert_type, pert_iname, name_query, source, z_score_cutoff, dataset ) %>%
+  summarize_at( "tau", ~.x[ which.max(abs(.x)) ] ) %>%
+  ungroup() %>%
+  mutate_at( "source", toupper )
+
+# FInd most similar drugs per query
+
+R3 <- R2 %>%
+  filter(pert_type %in% c("trt_oe", "trt_sh.cgs")) %>%
+  mutate(
+    pert_iname = paste(pert_iname, pert_type, sep = "_") %>%
+      str_replace(fixed("_trt_oe"), " OE") %>%
+      str_replace(fixed("_trt_sh.cgs"), " KD")
+  ) %>%
+  dplyr::filter(
+    pert_iname %in% {
+      group_by(., name_query) %>%
+        arrange(desc(abs(tau)), .by_group = TRUE) %>%
+        slice(1:10) %>%
+        ungroup() %>%
+        pull(pert_iname)
+    }
+    # pert_iname %in% {
+    #   mean_tau_by_pert <- group_by(., pert_iname) %>%
+    #     summarize(mean_tau = mean(tau), .groups = "drop")
+    #   inner_join(., mean_tau_by_pert, by = "pert_iname") %>%
+    #     group_by(name_query) %>%
+    #     mutate(abs_tau_diff = abs(tau - mean_tau)) %>%
+    #     arrange(desc(abs_tau_diff), .by_group = TRUE) %>%
+    #     slice(1:6) %>%
+    #     ungroup() %>%
+    #     pull(pert_iname)
+    # }
+  )
+
+
+## Perform hierarchical clustering on drugT profiles (columns in the final plot)
+## Use the DGE slice because it is cleaner and less saturated
+DM <- R3 %>% filter( source == "DGE" ) %>% select( name_query, pert_iname, tau ) %>%
+    spread( name_query, tau ) %>% as.data.frame %>% column_to_rownames("pert_iname")
+# comp_order <- function(clust) {
+#   clust %>% 
+#     reorder(dm) %>%
+#     dendextend::order.hclust() %>%
+#     labels(dm)[.]
+# }
+DM_clust <- DM %>%
+  dist() %>%
+  hclust() %>%
+  reorder(dist(DM))
+lvl <- DM_clust %>%
+  labels()
+split_vector <- cutree(DM_clust, k = 3)
+lvl2 <- R2 %>%
+  filter( source == "DGE" ) %>%
+  distinct(name_query, dataset) %>%
+  group_by(dataset) %>%
+  group_map(
+    ~DM[, unique(.x[["name_query"]])] %>%
+      t() %>%
+      comp_order()
+  ) %>%
+  {c(.[[2]], "", .[[1]])}
+
+## Fix the order via factor levels
+R3 <- R3 %>%
+  bind_rows(
+    tibble(
+      name_query = "",
+      pert_iname = unique(.[["pert_iname"]]),
+      tau = NA_real_
+    )
+  ) %>%
+  mutate(
+    # Horizontal facet split unite the second and third dendrogram cut
+    split_group = split_vector[pert_iname] %>%
+      as.character() %>%
+      recode("2" = "3"),
+    name_query = factor(name_query, lvl2),
+    pert_iname = factor(pert_iname, lvl)
+  )
+
+# # Complete missing observations at z-scores that yielded insufficient
+# # genes for Clue with NA
+# R2_completed <- bind_rows(
+#     R2 %>%
+#         filter(source == "DGE"),
+#     R2 %>%
+#         filter(source == "L1000") %>%
+#         complete(nesting(idQ, idT, source, drugT, drugQ), z_score_cutoff)
+# )
+
+## Plotting elements
+pal <- rev(RColorBrewer::brewer.pal(n=7, name="RdBu"))
+etxt <- function(s, ...) {element_text( size = s, face = "bold", ... )}
+theme_bold <- function() {
+    theme(axis.text.x = etxt(12, angle=90, hjust=1, vjust=0.5),
+          axis.text.y = etxt(12), axis.title = etxt(14),
+          legend.text = etxt(12), legend.title = etxt(14),
+          axis.ticks = element_blank())
+}
+
+## Plotting a heatmap of clue hits
+fplot <- function(X) {
+    ggplot(
+      # Arrange just so that cells with border are drawn last for clean rendering
+      X %>% arrange(name_query != ""),
+      aes(x=name_query,
+          y=pert_iname,
+          fill=tau)
+      )+
+        theme_minimal() + theme_bold() +
+        geom_tile(
+          aes(color = name_query == "")
+        ) +
+        # Remove cell borders in empty space between left and right side
+        scale_color_manual(
+          values = c("TRUE" = NA_character_, "FALSE" = "black"),
+          guide = FALSE
+        ) +
+        scale_fill_gradientn( colors=pal, limits=c(-100,100), na.value = "white" ) +
+        labs(x = "Drug query", y = "Clue target class", fill = "Tau" ) +
+        facet_wrap(~split_group, scales = "free_y") +
+        # Remove facet labels
+        theme(strip.background = element_blank(), strip.text.x = element_blank())
+}
+
+ggsave(
+  file.path(wd, "dub_sr_repurposing_unknown_drugs_genetic_pert_top6_abs_tau_genetic.pdf"),
+  fplot(R3),
+  width = 10, height = 9
+)
+
+fplot_horizontal <- function(X) {
+    ggplot(
+      # Arrange just so that cells with border are drawn last for clean rendering
+      X %>% arrange(name_query != ""),
+      aes(y=name_query,
+          x=pert_iname,
+          fill=tau)
+      )+
+        theme_minimal() + theme_bold() +
+        geom_tile(
+          aes(color = name_query == "")
+        ) +
+        # Remove cell borders in empty space between left and right side
+        scale_color_manual(
+          values = c("TRUE" = NA_character_, "FALSE" = "black"),
+          guide = FALSE
+        ) +
+        scale_fill_gradientn( colors=pal, limits=c(-100,100), na.value = "white" ) +
+        labs(y = "Drug query", x = "Clue target class", fill = "Tau" )
+}
+
+ggsave(
+  file.path(wd, "dub_sr_repurposing_unknown_drugs_genetic_pert_top6_abs_tau_genetic_horizontal.pdf"),
+  fplot_horizontal(R3),
+  width = 16, height = 4
+)
+
+
+```
