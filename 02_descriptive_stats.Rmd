@@ -32,10 +32,7 @@ data_sets <- data_sets %>%
     counts = map(name, ~read_csv(file.path("wrangled", .x, "counts.csv.gz")))
   )
 
-
 l1000 <- readr::read_csv(file.path("wrangled", "l1000_gene_list.csv"))
-
-
 ```
 
 
@@ -69,13 +66,49 @@ seq_depth_violin <- seq_depth %>%
       aes(name, ypos, label = median),
       data = . %>%
         group_by(name, method) %>%
-        summarize(median = format(median(depth), big.mark = ",", scientific = FALSE), ypos = median(depth)),
+        summarize(
+          median = format(median(depth), big.mark = ",", scientific = FALSE), ypos = median(depth)
+        ),
       label.size = 0
     ) +
     facet_wrap(vars(method))
+
 dir.create("descriptive_stats", showWarnings = FALSE)
 ggsave(here("descriptive_stats", "sequencing_depth_violin.pdf"), width = 5.5, height = 4.5)
 ```
+
+
+```{r sequencin_depth_plots_cdk}
+etxt <- function(s, ...) {element_text( size = s, face = "bold", ... )}
+theme_bold <- function() {
+    theme(axis.text.x = etxt(12, angle=90, hjust=1, vjust=0.5),
+          axis.text.y = etxt(12), axis.title = etxt(14),
+          legend.text = etxt(12), legend.title = etxt(14),
+          axis.ticks = element_blank())
+}
+
+
+seq_depth_violin <- seq_depth %>%
+  filter(name == "cdk") %>%
+  mutate_at(vars(method), ~recode(.x, bulk = "RNA-seq", dge = "DGE")) %>%
+  # Get rid out outlier bulk which has < 1000 counts
+  filter(depth > 1000) %>%
+  ggplot(aes(method, depth)) +
+    geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+    scale_y_log10() +
+    geom_label(
+      aes(method, ypos, label = median),
+      data = . %>%
+        group_by(name, method) %>%
+        summarize(median = format(median(depth), big.mark = ",", scientific = FALSE), ypos = median(depth)),
+      label.size = 0
+    ) +
+  labs(y = "Sequencing depth") +
+  theme_bold()
+dir.create("descriptive_stats", showWarnings = FALSE)
+ggsave(here("descriptive_stats", "sequencing_depth_violin_cdk_only.png"), width = 3.5, height = 4)
+```
+
 
 ```{r pca}
 pca_plot <- function (data, meta, aes = ggplot2::aes(PC1, PC2), extra_layers = NULL, ...) {
