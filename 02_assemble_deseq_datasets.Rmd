@@ -84,7 +84,7 @@ identical_vec <- function(vec, val) {
 }
 
 find_comparisons <- function(meta, concentration_method, replicate_method) {
-  drug_vars <- c("drug", "drug_norm", "drug_id", "drug_name", "lspci_id")
+  drug_vars <- c("drug_id", "lspci_id")
   exp_vars <- c("cells", "stim", "stim_conc", "time")
   condition_vars <- c(drug_vars, exp_vars)
   condition_vars <- switch(

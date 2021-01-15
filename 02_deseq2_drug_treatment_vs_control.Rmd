@@ -162,6 +162,115 @@ write_rds(
 
 ```
 
+```{r deseq_bulk}
+meta_bulk <- syn("syn21644142") %>%
+  read_csv()
+
+counts_bulk <- syn("syn21644266") %>%
+  read_rds()
+
+meta_bulk_deseq <- meta_bulk %>%
+  mutate(
+    condition = paste(cells, drug, time, sep = "_"),
+    control_condition = paste(cells, "control", time, sep = "_")
+  ) %>%
+  {
+    controls <- filter(., drug == "control") %>%
+      group_nest(condition, .key = "controls", keep = TRUE)
+    samples <- filter(., drug != "control")
+    samples %>%
+      group_nest(cells, drug, time, condition, control_condition, .key = "samples", keep = TRUE) %>%
+      inner_join(
+        controls, by = c("control_condition" = "condition")
+      ) %>%
+      filter(
+        map_lgl(samples, ~length(unique(.x[["drug_conc"]])) > 1),
+        map_lgl(controls, ~nrow(.x) > 1)
+      ) %>%
+      rowwise() %>%
+      mutate(
+        meta = bind_rows(
+          controls,
+          samples
+        ) %>%
+          mutate(drug_conc_log = log10(drug_conc + 1)) %>%
+          arrange(sample_id) %>%
+          list()
+      )
+  }
+
+input_deseq_bulk <- meta_bulk_deseq %>%
+  select(-samples, -controls) %>%
+  rowwise() %>%
+  mutate(
+    meta_deseq = meta %>%
+      column_to_rownames("sample_id") %>%
+      list(),
+    counts = counts_bulk$counts[[1]] %>%
+      filter(sample_id %in% meta[["sample_id"]]) %>%
+      arrange(sample_id) %>%
+      select(ensembl_gene_id, count, sample_id) %>%
+      spread(sample_id, count) %>%
+      column_to_rownames("ensembl_gene_id") %>%
+      as.matrix() %>%
+      list()
+  )
+
+run_deseq_comp <- function(meta_deseq, counts_deseq, design, ...) {
+  attr(design, ".Environment") <- baseenv()
+  de <- DESeq2::DESeqDataSetFromMatrix(
+    counts_deseq %>%
+      {.[, order(colnames(.))]},
+    meta_deseq %>%
+      {.[order(rownames(.)), ]},
+    design = design
+  ) %>%
+    DESeq2::DESeq()
+  name <- DESeq2::resultsNames(de)[[2]]
+  res <- DESeq2::results(de, name = name, alpha = 0.05)
+  shrunk <- DESeq2::lfcShrink(de, coef = name, res = res, type = "apeglm")
+  out_res <- as.data.frame(shrunk) %>%
+    rownames_to_column("ensembl_gene_id") %>%
+    as_tibble() %>%
+    left_join(
+      as.data.frame(res) %>%
+        rownames_to_column("ensembl_gene_id") %>%
+        select(ensembl_gene_id, log2FoldChange_MLE = log2FoldChange),
+      by = "ensembl_gene_id"
+    )
+  list(
+    deseq_object = de,
+    results = out_res
+  )
+}
+
+unloadNamespace("synapser")
+unloadNamespace("PythonEmbedInR")
+deseq_bulk <- input_deseq_bulk %>%
+  rowwise() %>%
+  mutate(
+    deseq = run_deseq_comp(meta_deseq, counts, ~drug_conc_log) %>%
+      list()
+  )
+
+
+deseq_res_bulk <- deseq_bulk %>%
+  select(-meta, -meta_deseq, -counts) %>%
+  rowwise() %>%
+  mutate(
+    deseq = deseq[["results"]] %>%
+      list()
+  ) %>%
+  ungroup()
+
+write_rds(
+  deseq_res_bulk,
+  here("deseq", "deseq_treatment_vs_control_bulk.rds")
+)
+
+```
+
+
 
 ```{r synapse}
 activity <- synapser::Activity(
@@ -173,10 +282,11 @@ activity <- synapser::Activity(
 )
 
 c(
-  here("deseq", "deseq_treatment_vs_control.rds")
+  here("deseq", "deseq_treatment_vs_control.rds"),
+  here("deseq", "deseq_treatment_vs_control_bulk.rds")
 ) %>%
   synStoreMany(parentId = "syn21558153", activity = activity)
 
-#rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens/
+#rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens
 ```
 
