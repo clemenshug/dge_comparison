@@ -438,6 +438,89 @@ c(
 ```
 
 
+```{r query_cmap_cdk_only}
+cdk_drugs <- c(
+  ribociclib = 89588,
+  palbociclib = 91464
+)
+
+cdk_gene_sets <- dge_gene_sets %>%
+  filter(
+    lspci_id %in% cdk_drugs,
+    concentration_method == "per_concentration",
+    replicate_method == "replicates_aggregated"
+  ) %>%
+  select(gene_set_name, gene_sets)
+
+MAX_PER_QUERY = 20
+comp_res_clue <- cdk_gene_sets %>%
+  split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
+  map(
+    ~.x %>%
+      unnest_longer(gene_sets, indices_to = "direction", values_to = "gene_id") %>%
+      unchop(gene_id) %>%
+      drop_na(gene_id, direction) %>%
+      group_by(gene_set_name) %>%
+      filter(n() > 10) %>%
+      ungroup() %>%
+      # remove gene_ids that are in both up and down set
+      # Can happen due to entrez_id mapping
+      group_by(gene_set_name, gene_id) %>%
+      filter(n() == 1) %>%
+      ungroup() %>%
+      select(gene_set = gene_set_name, gene_id, direction)
+  ) %>%
+  keep(~nrow(.x) > 0) %>%
+  map(
+    clue_gmt_from_df,
+    drop_invalid = TRUE
+  )
+
+comp_res_jobs <- comp_res_clue %>%
+  imap(
+    ~clue_query_submit(
+      .x[["up"]], .x[["down"]],
+      name = paste0("dge_job_", .y),
+      use_fast_tool = FALSE
+    )
+  )
+
+comp_res_jobs <- c(
+  "5ff8877d0eafdb0011e488d6",
+  "5ff8875eb5e100001293e846",
+  "5ff8873d0eafdb0011e488d4",
+  "5ff885f40eafdb0011e488d2"
+)
+
+failed_mask <- map(
+  comp_res_jobs,
+  clue_query_poll
+) %>%
+  map_lgl(~!identical(.x[["download_status"]], "completed"))
+
+resub_jobs <- comp_res_clue[failed_mask] %>%
+  imap(
+    ~clue_query_submit(
+      .x[["up"]], .x[["down"]],
+      name = paste0("dge_job_", .y),
+      use_fast_tool = FALSE
+    )
+  )
+
+walk(
+  comp_res_jobs,
+  clue_query_wait
+)
+
+comp_res_clue_res <- map_chr(
+  comp_res_jobs,
+  clue_query_download
+)
+
+```
+
+
+
 ```{r querying_cmap_with_l1000_measured_only}
 # Take only highest concentration / longest time
 selected_signatures <- signatures_dge %>%
