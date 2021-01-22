@@ -61,6 +61,33 @@ deseq_meta <- syn("syn21558154.4") %>%
 
 ```
 
+```{r find_gene_sets}
+# Find gene sets that are actuallly used
+# No stimulus, last available time point
+
+meta_long <- syn("syn22000707.11") %>%
+  read_rds() %>%
+  unnest(meta)
+
+used_dge_signatures <- meta_long %>%
+  filter(is.na(stim) | stim == "control", dataset != "fp_transdiff") %>%
+  distinct(dataset, date, cells, drug, time) %>%
+  group_by(dataset, date, cells, drug) %>%
+  arrange(desc(time)) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+  
+cdk_used_dge_signatures <- used_dge_signatures %>%
+  filter(dataset == "lincs_cdk4_6_7")
+
+write_csv(
+  cdk_used_dge_signatures,
+  "cdk_used_signatures.csv"
+)
+
+```
+
+
 ```{r sr_drug_repurposing}
 ## Load all results
 R <- clue_res_combined %>%
@@ -419,14 +446,22 @@ dubs <- deseq_res %>%
   inner_join(
     dge_meta %>%
         unnest(meta) %>%
-        filter(
-          dataset %in% c("sr_repurposing", "ld_dub"),
-          !lspci_id %in% signature_meta$lspci_id, is.na(stim)
+        mutate(
+          query_group = case_when(
+            lspci_id %in% c(91047, 93750) ~ "controls",
+            !lspci_id %in% signature_meta$lspci_id ~ paste("unknowns", dataset, sep = " "),
+            TRUE ~ NA_character_
+          )
         ) %>%
-        group_by(drug_id) %>%
+        filter(
+          !is.na(query_group),
+          dataset %in% c("sr_repurposing", "ld_dub", "lincs_cdk4_6_7"),
+          is.na(stim)
+        ) %>%
+        group_by(query_group, dataset, cells, drug_id) %>%
         arrange(desc(time)) %>%
         slice(1) %>%
-        select(cells, drug_id, time, stim, dataset),
+        select(query_group, cells, drug_id, time, stim, dataset),
     by = c("cells", "drug_id", "time", "stim")
   )
 
@@ -437,12 +472,16 @@ R2 <- R %>%
   # filter(pert_type == "trt_cp") %>%
   inner_join(
     dubs %>%
-      distinct(gene_set, drug_id, dataset),
+      distinct(query_group, gene_set, drug_id, dataset),
     by = "gene_set"
   ) %>%
   # dplyr::rename(pert_iname = id) %>%
-  group_by( pert_type, pert_iname, name_query, source, z_score_cutoff, dataset ) %>%
-  summarize_at( "tau", ~.x[ which.max(abs(.x)) ] ) %>%
+  group_by( query_group, pert_type, pert_iname, name_query, source, z_score_cutoff ) %>%
+  summarize_at(
+    # "tau", ~quantile(.x, c(0.67, 0.33), names = FALSE) %>%
+    #             {.[order(abs(.))[2]]}
+    "tau", ~.x[ which.max(abs(.x)) ]
+  ) %>%
   ungroup() %>%
   mutate_at( "source", toupper )
 
@@ -479,37 +518,66 @@ R3 <- R2 %>%
 
 ## Perform hierarchical clustering on drugT profiles (columns in the final plot)
 ## Use the DGE slice because it is cleaner and less saturated
-DM <- R3 %>% filter( source == "DGE" ) %>% select( name_query, pert_iname, tau ) %>%
-    spread( name_query, tau ) %>% as.data.frame %>% column_to_rownames("pert_iname")
-# comp_order <- function(clust) {
-#   clust %>% 
-#     reorder(dm) %>%
-#     dendextend::order.hclust() %>%
-#     labels(dm)[.]
-# }
+DM <- R3 %>%
+  filter( source == "DGE" ) %>%
+  select(
+    name_query,
+    pert_iname,
+    tau
+  ) %>%
+  spread( name_query, tau ) %>%
+  as.data.frame %>%
+  column_to_rownames("pert_iname")
+
+comp_order <- function(clust) {
+  dm <- clust %>%
+    dist()
+  dm %>%
+    hclust() %>%
+    reorder(dm) %>%
+    labels()
+}
+
 DM_clust <- DM %>%
   dist() %>%
   hclust() %>%
   reorder(dist(DM))
+
 lvl <- DM_clust %>%
   labels()
+
 split_vector <- cutree(DM_clust, k = 3)
+
 lvl2 <- R2 %>%
   filter( source == "DGE" ) %>%
-  distinct(name_query, dataset) %>%
-  group_by(dataset) %>%
+  distinct(name_query, query_group) %>%
+  group_by(query_group) %>%
   group_map(
-    ~DM[, unique(.x[["name_query"]])] %>%
-      t() %>%
-      comp_order()
+    function(.x, ...) {
+      queries <- unique(.x[["name_query"]])
+      if (length(queries) == 1)
+        return(queries)
+      DM[, queries] %>%
+        t() %>%
+        comp_order()
+    }
   ) %>%
-  {c(.[[2]], "", .[[1]])}
+  # Add blank spaces between datasets
+  {
+    imap(
+      .,
+      ~c(.x, strrep(" ", .y))
+    ) %>%
+      {
+        exec(c, !!!.)
+      }
+  }
 
 ## Fix the order via factor levels
 R3 <- R3 %>%
   bind_rows(
-    tibble(
-      name_query = "",
+    crossing(
+      name_query = setdiff(lvl2, unique(R3[["name_query"]])),
       pert_iname = unique(.[["pert_iname"]]),
       tau = NA_real_
     )
@@ -547,14 +615,14 @@ theme_bold <- function() {
 fplot <- function(X) {
     ggplot(
       # Arrange just so that cells with border are drawn last for clean rendering
-      X %>% arrange(name_query != ""),
+      X %>% arrange(!str_detect(name_query, "^( )+$")),
       aes(x=name_query,
           y=pert_iname,
           fill=tau)
       )+
         theme_minimal() + theme_bold() +
         geom_tile(
-          aes(color = name_query == "")
+          aes(color = str_detect(name_query, "^( )+$"))
         ) +
         # Remove cell borders in empty space between left and right side
         scale_color_manual(
@@ -569,7 +637,7 @@ fplot <- function(X) {
 }
 
 ggsave(
-  file.path(wd, "dub_sr_repurposing_unknown_drugs_genetic_pert_top6_abs_tau_genetic.pdf"),
+  file.path(wd, "dub_sr_repurposing_unknown_drugs_genetic_pert_top6_abs_tau_genetic_including_controls.pdf"),
   fplot(R3),
   width = 10, height = 9
 )
