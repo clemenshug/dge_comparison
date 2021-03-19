@@ -135,7 +135,8 @@ cdk_old_meta <- cdk_old_meta_raw %>%
     well,
     cells = cell_line,
     drug = recode(drug, "DMSO" = "control"),
-    drug_conc = concentration__um
+    drug_conc = concentration__um,
+    time = 6
   )
 
 ```
@@ -153,7 +154,8 @@ cdk_new_meta <- cdk_new_meta_raw %>%
     well,
     cells = cell_line,
     drug  = recode(agent, "DMSO" = "control"),
-    drug_conc = concentration
+    drug_conc = concentration,
+    time = timepoint
   )
 
 ```
@@ -241,7 +243,8 @@ fp_transdiff_meta <- fp_transdiff_meta_raw %>%
     cells = "mouse_embryonic_fibroblasts",
     # Exact concentration unknown...
     drug_conc = if_else(drug != "control", 1, 0),
-    replicate = 1
+    replicate = 1,
+    time = 24
   ) %>%
   # Experiment contains 4 identical plates
   crossing(plate = 1:4)
@@ -488,17 +491,18 @@ datasets <- datasets_counts %>%
   ) %>%
   select(-meta)
 
+library(qs)
 
-write_rds(
+qsave(
   datasets,
-  file.path(wd, "counts_raw.rds"),
-  compress = "gz"
+  file.path(wd, "counts_raw.qs"),
+  preset = "high"
 )
 
-write_rds(
+qsave(
   meta_cmpd_mapped,
-  file.path(wd, "meta_mapped.rds"),
-  compress = "gz"
+  file.path(wd, "meta_mapped.qs"),
+  preset = "high"
 )
 
 dataset_names <- tribble(
@@ -542,9 +546,9 @@ activity <- synapser::Activity(
 )
 
 c(
-  file.path(wd, "counts_raw.rds"),
+  file.path(wd, "counts_raw.qs"),
   file.path(wd, "dataset_names.csv"), 
-  file.path(wd, "meta_mapped.rds")
+  file.path(wd, "meta_mapped.qs")
 ) %>%
   synStoreMany(parentId = "syn21542764", activity = activity)
 
