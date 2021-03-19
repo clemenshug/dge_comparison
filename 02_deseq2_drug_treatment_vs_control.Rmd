@@ -9,6 +9,7 @@ output: html_document
 library(tidyverse)
 library(here)
 library(synExtra)
+library(qs)
 
 synapser::synLogin()
 syn <- synDownloader(here("data"))
@@ -22,8 +23,8 @@ Calculating differentially expressed genes between drug treatment conditions
 and control for DGE.
 
 ```{r read_data}
-deseq_input <- syn("syn21558154") %>%
-  read_rds()
+deseq_input <- syn("syn25292412") %>%
+  qread()
 
 ```
 
@@ -32,14 +33,14 @@ deseq_input <- syn("syn21558154") %>%
 
 ```{r deseq_drugs_vs_control}
 wd <- here("deseq", "treatment_vs_control")
-dir.create(wd)
+dir.create(wd, recursive = TRUE)
 
 chunked_deseq_input <- deseq_input %>%
   lspcheminf::chunk_df(100, seed = 1) %>%
   enframe(name = "chunk", value = "data") %>%
   mutate(
-    input_file = file.path(wd, paste0("deseq_input_", chunk, ".rds")),
-    output_file = file.path(wd, paste0("deseq_result_", chunk, ".rds"))
+    input_file = file.path(wd, paste0("deseq_input_", chunk, ".qs")),
+    output_file = file.path(wd, paste0("deseq_result_", chunk, ".qs"))
   ) %>%
   # Have to get rid of some spurious samples where there is only control and some
   # other controls, eg. LPS
@@ -53,10 +54,10 @@ chunked_deseq_input <- deseq_input %>%
 pwalk(
   chunked_deseq_input,
   function(data, input_file, ...) {
-    write_rds(
+    qsave(
       data,
       input_file,
-      compress = "gz"
+      preset = "fast"
     )
   }
 )
@@ -77,7 +78,7 @@ process_deseq <- function(input, output) {
     ) %>%
       DESeq2::DESeq()
     name <- DESeq2::resultsNames(de)[[2]]
-    res <- DESeq2::results(de, name = name, alpha = 0.05)
+    res <- DESeq2::results(de, name = name, alpha = 0.1)
     shrunk <- DESeq2::lfcShrink(de, coef = name, res = res, type = "apeglm")
     out_res <- as.data.frame(shrunk) %>%
       rownames_to_column("ensembl_gene_id") %>%
@@ -93,13 +94,13 @@ process_deseq <- function(input, output) {
       results = out_res
     )
   }
-  deseq_input <- read_rds(input)
+  deseq_input <- qs::qread(input)
   res <- pmap(deseq_input, run_deseq_comp)
-  write_rds(
+  qs::qsave(
     res %>%
       map("results"),
     output,
-    compress = "gz"
+    preset = "fast"
   )
 }
 
@@ -142,7 +143,7 @@ deseq_results <- chunked_deseq_input %>%
       data, output_file,
       # ~.x[["results"]] <- read_rds(.y)
       function(data, output_file) {
-        x <- read_rds(output_file)
+        x <- qread(output_file)
         if (nrow(data) != length(x))
           browser()
         data[["results"]] <- x
@@ -153,11 +154,28 @@ deseq_results <- chunked_deseq_input %>%
   pull(data) %>%
   bind_rows()
 
-
-write_rds(
+qsave(
   deseq_results,
-  here("deseq", "deseq_treatment_vs_control.rds"),
-  compress = "gz"
+  here("deseq", "deseq_treatment_vs_control.qs"),
+  preset = "high"
+)
+
+qsave(
+  deseq_results %>%
+    select(-counts_deseq),
+  here("deseq", "deseq_treatment_vs_control_no_counts.qs"),
+  preset = "high"
+)
+
+deseq_results_long <- deseq_results %>%
+  select(
+    -samples, -design, -meta_deseq, -counts_deseq
+  ) %>%
+  unnest(results)
+
+data.table::fwrite(
+  deseq_results_long,
+  here("deseq", "deseq_treatment_vs_control_results.csv.gz")
 )
 
 ```
@@ -282,10 +300,12 @@ activity <- synapser::Activity(
 )
 
 c(
-  here("deseq", "deseq_treatment_vs_control.rds"),
+  here("deseq", "deseq_treatment_vs_control.qs"),
+  here("deseq", "deseq_treatment_vs_control_no_counts.qs"),
+  here("deseq", "deseq_treatment_vs_control_results.csv.gz"),
   here("deseq", "deseq_treatment_vs_control_bulk.rds")
 ) %>%
-  synStoreMany(parentId = "syn21558153", activity = activity)
+  synStoreMany(parentId = "syn21558153", activity = activity, forceVersion = FALSE)
 
 #rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens
 ```
