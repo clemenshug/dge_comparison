@@ -8,14 +8,15 @@ output: html_document
 ```{r setup, include=FALSE}
 library(tidyverse)
 library(cmapR)
-library(webchem)
+#library(webchem)
 library(synExtra)
 library(here)
 library(lspcheminf)
+library(batchtools)
 library(furrr)
 
 synapser::synLogin()
-syn <- synExtra::synDownloader("~/data/DGE_comp/")
+syn <- synExtra::synDownloader(here("data"))
 ```
 
 
@@ -46,60 +47,113 @@ numbers. Loading metadata and Z-score matrix from both.
 
 
 ```{r perturbation_meta}
+# Warning OK
 pertubation_meta_raw <- list(
   GSE92742 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_pert_info.txt.gz",
-  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_pert_info_2017-03-06.txt.gz"
+  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_pert_info_2017-03-06.txt.gz",
+  LINCS_2020 = syn("syn25049483")
 ) %>%
   map(read_tsv, na = "-666") %>%
   bind_rows(.id = "dataset")
 
+run_canonicalize_job <- function(compound_df, timeout = 5*60) {
+  input_tmp <- tempfile()
+  output_tmp <- tempfile()
+  readr::write_csv(compound_df, input_tmp)
+  script_path <- tempfile("shell_script_", fileext = ".sh")
+  script <- c(
+    "unset PYTHONPATH",
+    "unset PYTHONHOME",
+    "source ~/miniconda3/etc/profile.d/conda.sh",
+    "conda activate lspcheminf_env",
+    "which -a python",
+    "env",
+    paste(
+      "tautomers canonicalize",
+      "--standardizer molvs",
+      "--timeout", timeout,
+      "--compound-encoding", "smiles",
+      input_tmp,
+      output_tmp
+    )
+  )
+  message("SCRIPT:\n", paste(paste0("# ", script), collapse = "\n"), "\n")
+  writeLines(
+    script,
+    con = script_path
+  )
+  out <- sys::exec_wait("bash", script_path)
+  if (out != 0)
+    stop("Canonicalization failed with error code ", out)
+  readr::read_csv(output_tmp)
+}
+
 unique_compounds <- pertubation_meta_raw %>%
   drop_na(canonical_smiles) %>%
-  distinct(pert_id, smiles = canonical_smiles) %>%
-  left_join(
-    convert_compound_identifier(
-      set_names(.$smiles, .$pert_id),
-      identifier = "smiles",
-      target_identifier = "inchi"
-    ) %>%
-      select(inchi = compounds, pert_id = names),
-    by = "pert_id"
+  distinct(pert_id, compound = canonical_smiles)
+
+unique_compounds_chunked <- unique_compounds %>%
+  split(rep_len(1:50, nrow(.)))
+
+reg <- makeRegistry(
+  file.dir = here(paste0("registry_", gsub(" ", "_", Sys.time()))),
+  seed = 1
+)
+
+batchMap(
+  fun = run_canonicalize_job,
+  compound_df = unique_compounds_chunked,
+  # Limiting canonicalization to 5 min per compound
+  more.args = list(timeout = 5*60)
+)
+
+job_table <- findJobs() %>%
+  # Chunk jobs into a single array job
+  mutate(chunk = 1)
+
+submitJobs(
+  job_table,
+  resources = list(
+    memory = "6gb",
+    ncpus = 1L,
+    partition = "short",
+    walltime = 15*60,
+    chunks.as.arrayjobs = TRUE,
+    # For some reason these nodes fail to execute R because of an "illegal instruction"
+    exclude = "compute-f-17-[09-25]"
+  )
+)
+
+unique_compounds_canonical <- unique_compounds_chunked %>%
+  enframe("chunk", "raw") %>%
+  mutate(
+    canonical = map2(
+      chunk, raw,
+      ~.y %>%
+        mutate(row = 1:n() - 1) %>%
+        left_join(
+          loadResult(as.integer(.x)),
+          by = "row"
+        )
+    )
+  ) %>%
+  pull(canonical) %>%
+  bind_rows() %>%
+  select(
+    pert_id, inchi
   )
 
-
-
-plan(multisession(workers = 8))
-unique_compounds_canonical <- unique_compounds %>%
-  distinct(pert_id, inchi) %>%
-  drop_na() %>%
-  chunk_df(16) %>%
-  future_map(
-    ~left_join(
-      .x,
-      canonicalize_compound(
-        set_names(.x$inchi, .x$pert_id),
-        standardize = TRUE
-      ) %>%
-        select(pert_id = compound, canonical_inchi = inchi),
-      by = "pert_id"
-    ),
-    .progress = TRUE
-  ) %>%
-  bind_rows()
-
-write_rds(
+write_csv(
   unique_compounds_canonical,
-  here("wrangled", "cmap_compounds_canonical.rds"),
-  compress = "gz"
+  here("wrangled", "cmap_compounds_canonical.csv.gz")
 )
 
 # unique_compounds_canonical <- read_rds(
 #   here("wrangled", "cmap_compounds_canonical.rds")
 # )
 
-
 unique_compounds_fingerprints <- unique_compounds_canonical %>%
-  drop_na(canonical_inchi) %>%
+  drop_na(inchi) %>%
   crossing(
     fingerprint_type = c("morgan", "topological")
   ) %>%
@@ -108,17 +162,16 @@ unique_compounds_fingerprints <- unique_compounds_canonical %>%
     data = map2(
       data, fingerprint_type,
       function(df, fpt) {
-        q <- set_names(df[["canonical_inchi"]], df[["pert_id"]])
-        attr(q, "identifier") <- "inchi"
+        q <- set_names(df[["inchi"]], df[["pert_id"]])
         lspcheminf::calculate_fingerprints(q, fpt)
       }
     )
-  )
+  ) %>%
+  unnest(data)
 
-write_rds(
+write_csv(
   unique_compounds_fingerprints,
-  here("wrangled", "cmap_compound_fingerprints.rds"),
-  compress = "gz"
+  here("wrangled", "cmap_compound_fingerprints.csv.gz")
 )
 
 # unique_compounds_fingerprints <- read_rds(
@@ -129,22 +182,39 @@ lsp_fp <- fingerprints %>%
   filter(fp_name == "morgan_normal") %>%
   chuck("data", 1) %>%
   filter(fp_name != "morgan_chiral") %>%
+  inner_join(
+    compound_dict %>%
+      filter(fp_name == "morgan_normal") %>%
+      chuck("data", 1) %>%
+      select(lspci_id, inchi),
+    by = "lspci_id"
+  ) %>%
+  drop_na() %>%
   group_nest(fingerprint_type = fp_type, .key = "reference")
 
 compound_lspci_id_mapping <- unique_compounds_fingerprints %>%
+  inner_join(
+    unique_compounds_canonical,
+    by = c("names" = "pert_id")
+  ) %>%
+  drop_na() %>%
+  group_nest(fingerprint_type) %>%
   left_join(
-    lsp_fp, by = "fingerprint_type"
+    lsp_fp,
+    by = "fingerprint_type"
   ) %>%
   mutate(
     data = map2(
       data, reference,
       function(d, r) {
-        dq <- set_names(d[["fingerprints"]], d[["names"]])
-        rq <- set_names(r[["fingerprint"]], as.character(r[["lspci_id"]]))
+        dq <- set_names(d[["inchi"]], d[["names"]]) %>%
+          compounds(fingerprints = d[["fingerprints"]])
+        rq <- set_names(r[["inchi"]], as.character(r[["lspci_id"]])) %>%
+          compounds(fingerprints = r[["fingerprint"]])
         # browser()
         lspcheminf::chemical_similarity_threshold(
-          dq, rq, precalculated = TRUE, threshold = 0.99999,
-          n_threads = 10
+          dq, rq, threshold = 1,
+          n_threads = 1
         )
       }
     )
@@ -155,13 +225,13 @@ compound_dict_chunks <- compound_dict %>%
   chuck("data", 1) %>%
   drop_na(inchi) %>%
   select(lspci_id, inchi) %>%
-  chunk_df(16)
+  chunk_df(15, seed = 1)
 
+plan(sequential)
 compound_dict_mw <- compound_dict_chunks %>%
   future_map(
     ~lspcheminf::molecular_mass(
-      set_names(.x$inchi, .x$lspci_id),
-      url = "http://127.0.0.1:8001"
+      set_names(.x$inchi, .x$lspci_id)
     ),
     .progress = TRUE
   )
@@ -173,16 +243,15 @@ compound_dict_mw_df <- compound_dict_mw %>%
     mass
   )
 
-write_rds(
+write_csv(
   compound_dict_mw_df,
-  here("wrangled", "compound_dict_mw.rds"),
-  compress = "gz"
+  here("wrangled", "compound_dict_mw.csv.gz")
 )
 
 cmap_mw <- unique_compounds_canonical %>%
-  drop_na(canonical_inchi) %>%
-  {set_names(.[["canonical_inchi"]], .[["pert_id"]])} %>%
-  lspcheminf::molecular_mass(url = "http://127.0.0.1:8001")
+  drop_na(inchi) %>%
+  {set_names(.[["inchi"]], .[["pert_id"]])} %>%
+  lspcheminf::molecular_mass()
 
 compound_lspci_id_mapping_df <- compound_lspci_id_mapping %>%
   select(data, fingerprint_type) %>%
@@ -206,7 +275,6 @@ compound_lspci_id_mapping_df <- compound_lspci_id_mapping %>%
   ) %>%
   ungroup() %>%
   distinct(pert_id = query, lspci_id = target)
-
 
 write_csv(
   compound_lspci_id_mapping_df,
@@ -245,7 +313,8 @@ write_csv(pertubation_meta, here("wrangled", "cmap_perturbation_meta.csv.gz"))
 ```{r instance_meta}
 instance_meta_raw <- list(
   GSE92742 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_inst_info.txt.gz",
-  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_inst_info_2017-03-06.txt.gz"
+  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_inst_info_2017-03-06.txt.gz",
+  LINCS_2020 = syn("syn25050165")
 ) %>%
   map(read_tsv, na = "-666") %>%
   bind_rows(.id = "dataset")
@@ -253,7 +322,7 @@ instance_meta_raw <- list(
 instance_meta <- instance_meta_raw %>%
   left_join(distinct(pertubation_meta, pert_id, pubchem_cid, lspci_id), by = "pert_id")
 
-write_csv(instance_meta, file.path("..", "wrangled", "cmap_instance_meta.csv.gz"))
+write_csv(instance_meta, here("wrangled", "cmap_instance_meta.csv.gz"))
 ```
 
 
@@ -262,7 +331,8 @@ write_csv(instance_meta, file.path("..", "wrangled", "cmap_instance_meta.csv.gz"
 ```{r signature_meta}
 signature_meta_raw <- list(
   GSE92742 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_sig_info.txt.gz",
-  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_sig_info_2017-03-06.txt.gz"
+  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_sig_info_2017-03-06.txt.gz",
+  LINCS_2020 = syn("syn25050186")
 ) %>%
   map(read_tsv, na = c("-666", "-666.00")) %>%
   bind_rows(.id = "dataset")
@@ -279,14 +349,15 @@ signature_meta <- signature_meta_raw %>%
   ) %>%
   left_join(distinct(pertubation_meta, pert_id, lspci_id), by = "pert_id")
 
-write_csv(signature_meta, file.path("..", "wrangled", "cmap_signature_meta.csv.gz"))
+write_csv(signature_meta, here("wrangled", "cmap_signature_meta.csv.gz"))
 ```
 
 
 ```{r gene_meta}
 gene_meta_raw <- list(
   GSE92742 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_gene_info.txt.gz",
-  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_gene_info_2017-03-06.txt.gz"
+  GSE70138 = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_gene_info_2017-03-06.txt.gz",
+  LINCS_2020 = syn("syn25050895")
 ) %>%
   map(read_tsv, na = "-666") %>%
   bind_rows(.id = "dataset")
@@ -309,7 +380,7 @@ gene_meta <- gene_meta_raw %>%
   ) %>%
   select(-dataset)
 
-write_csv(gene_meta, file.path("..", "wrangled", "cmap_gene_meta.csv.gz"))
+write_csv(gene_meta, here("wrangled", "cmap_gene_meta.csv.gz"))
 ```
 
 Gene metadata for both datasets are identical, can save just a single one.
@@ -325,7 +396,9 @@ activity <- synapser::Activity(
     "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_sig_info.txt.gz",
     "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_sig_info_2017-03-06.txt.gz",
     "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_gene_info.txt.gz",
-    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_gene_info_2017-03-06.txt.gz"
+    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE70nnn/GSE70138/suppl/GSE70138_Broad_LINCS_gene_info_2017-03-06.txt.gz",
+    "syn20835543",
+    "syn21042105"
   ),
   executed = "https://github.com/clemenshug/dge_comparison/blob/master/wrangling/05_cmap_data.Rmd"
 )
@@ -336,7 +409,7 @@ c(
   here("wrangled", "cmap_signature_meta.csv.gz"),
   here("wrangled", "cmap_gene_meta.csv.gz")
 ) %>%
-  synStoreMany(parentId = "syn21547022", activity = activity)
+  synStoreMany(parentId = "syn21547022", activity = activity, versionLabel = "Add new LINCS 2020 dataset")
 
 #rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens/
 ```
