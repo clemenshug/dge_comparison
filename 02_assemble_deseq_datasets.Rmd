@@ -4,6 +4,7 @@ library(synExtra)
 library(tidyverse)
 library(here)
 library(furrr)
+library(qs)
 # library(synapser)
 
 synapser::synLogin()
@@ -18,11 +19,11 @@ dir.create(wd, showWarnings = FALSE)
 
 
 ```{r read_data}
-counts_raw <- syn("syn21544261") %>%
-  read_rds()
+counts_raw <- syn("syn25292308") %>%
+  qread()
 
-meta <- syn("syn22000707") %>%
-  read_rds()
+meta <- syn("syn25292310") %>%
+  qread()
 
 ```
 
@@ -203,11 +204,11 @@ datasets_deseq <- valid_comparisons %>%
     )
   )
 
-write_rds(
+qsave(
   datasets_deseq %>%
     select(-treated, -controls),
-  here("deseq", "deseq_input.rds"),
-  compress = "gz"
+  here("deseq", "deseq_input.qs"),
+  preset = "high"
 )
 
 ```
@@ -217,14 +218,14 @@ write_rds(
 activity <- synapser::Activity(
   name = "Wrangle DGE data",
   used = c(
-    "syn21544261",
-    "syn22000707"
+    "syn25292308",
+    "syn25292310"
   ),
   executed = "https://github.com/clemenshug/dge_comparison/blob/master/02_assemble_deseq_datasets.Rmd"
 )
 
 c(
-  here("deseq", "deseq_input.rds")
+  here("deseq", "deseq_input.qs")
 ) %>%
   synStoreMany(parentId = "syn21558153", activity = activity)
 
