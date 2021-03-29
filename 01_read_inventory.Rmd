@@ -40,19 +40,19 @@ count_stats <- datasets %>%
 
 dataset_stats <- count_stats %>%
   drop_na(sample_id) %>%
-  group_by(dataset, batch, plate, count_type) %>%
+  group_by(dataset, batch, plate, date, count_type) %>%
   summarize(count = sum(count)) %>%
   ungroup() %>%
   mutate_at(vars(plate), as.numeric) %>%
   bind_rows(
     fastq_counts %>%
-      transmute(dataset, batch, plate, count_type = "fastq_count", count = fastq_count)
+      transmute(dataset, date, plate, batch = paste(dataset, date, plate, sep = "_"), count_type = "fastq_count", count = fastq_count)
   ) %>%
   mutate(
     count_type = factor(count_type, levels = c("fastq_count", "barcode_counts", "count_dupes", "counts"))
   ) %>%
-  arrange(dataset, batch, plate, count_type) %>%
-  group_by(dataset, batch, plate) %>%
+  arrange(dataset, date, plate, count_type) %>%
+  group_by(dataset, date, plate) %>%
   mutate(
     count_fraction = count / count[[1]],
     count_prev_fraction = count / c(count[[1]], head(count, -1)),
@@ -76,16 +76,20 @@ count_names <- tribble(
   "count_dupes", "gene counts",
   "counts", "deduplicated gene counts"
 ) %>%
-  mutate(
-    count_type_name = as.factor(count_type_name) %>%
-      fct_inorder() %>%
-      fct_rev()
+  mutate_at(
+    vars(count_type, count_type_name),
+    . %>%
+      as.factor() %>%
+      fct_inorder()
   )
 
 dataset_stats_bars <- dataset_stats %>%
   inner_join(dataset_names) %>%
   inner_join(count_names) %>%
-  mutate(dataset_name = fct_cross(dataset_name, as.factor(plate) %>% fct_inseq(), sep = "_")) %>%
+  mutate(
+    dataset_name = fct_cross(dataset_name, as.factor(plate) %>% fct_inseq(), sep = "_"),
+    count_type_name = fct_rev(count_type_name)
+  ) %>%
   ggplot(aes(dataset_name, count_prev_fraction, fill = count_type_name)) +
     geom_col(position = "dodge") +
     coord_flip() +
@@ -102,7 +106,10 @@ ggsave(
 dataset_remaining_stats_bars <- dataset_stats %>%
   inner_join(dataset_names) %>%
   inner_join(count_names) %>%
-  mutate(dataset_name = fct_cross(dataset_name, as.factor(plate) %>% fct_inseq(), sep = "_")) %>%
+  mutate(
+    dataset_name = fct_cross(dataset_name, as.factor(plate) %>% fct_inseq(), sep = "_"),
+    count_type_name = fct_rev(count_type_name)
+  ) %>%
   ggplot(aes(dataset_name, count_fraction, fill = count_type_name)) +
     geom_col(position = "dodge") +
     coord_flip() +
@@ -118,7 +125,10 @@ ggsave(
 dataset_stats_bars_abs <- dataset_stats %>%
   inner_join(dataset_names) %>%
   inner_join(count_names) %>%
-  mutate(dataset_name = fct_cross(dataset_name, as.factor(plate) %>% fct_inseq(), sep = "_")) %>%
+  mutate(
+    dataset_name = fct_cross(dataset_name, as.factor(plate) %>% fct_inseq(), sep = "_"),
+    count_type_name = fct_rev(count_type_name)
+  ) %>%
   ggplot(aes(dataset_name, count, fill = count_type_name)) +
     geom_col(position = "dodge") +
     coord_flip() +
