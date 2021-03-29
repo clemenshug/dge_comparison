@@ -1,0 +1,374 @@
+---
+title: "Generate gene sets"
+author: "Clemens Hug"
+date: "7/2/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(genebabel)
+library(biomaRt)
+library(synExtra)
+library(here)
+library(data.table)
+library(cluequery)
+library(qs)
+library(fst)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("data")
+
+wd <- here("clue_query")
+dir.create(wd, showWarnings = FALSE)
+```
+
+## Goal
+
+Query 
+
+
+
+```{r loading}
+deseq_res <- syn("syn25303172") %>%
+  qread()
+
+signature_meta <- syn("syn21547101") %>%
+  fread()
+
+perturbation_meta <- syn("syn21547097") %>%
+  fread()
+
+cmap_gene_meta <- syn("syn21547102") %>%
+  fread()
+```
+
+```{r gene_sets_dge}
+ensembl <- useEnsembl(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", version = "98")
+
+all_ensembl_ids <- deseq_res %>%
+  pull(results) %>%
+  map("ensembl_gene_id") %>%
+  reduce(union)
+
+gene_id_mapping <- getBM(
+  c("entrezgene_id", "ensembl_gene_id"),
+  filters = "ensembl_gene_id",
+  values = all_ensembl_ids,
+  mart = ensembl
+)
+
+unloadNamespace("biomaRt")
+unloadNamespace("AnnotationDBI")
+
+gene_id_mapping_valid <- gene_id_mapping %>%
+  drop_na()
+
+dge_gene_sets <- deseq_res %>%
+  select(-samples, -design, -meta_deseq) %>%
+  mutate(
+    gene_set_table = map(
+      results,
+      ~.x %>%
+        inner_join(gene_id_mapping_valid, by = "ensembl_gene_id") %>%
+        filter(padj < 0.1) %>%
+        mutate(direction = if_else(log2FoldChange > 0, "up", "down")) %>%
+        arrange(desc(abs(log2FoldChange)))
+    ),
+    gene_sets = map(
+      gene_set_table,
+      ~.x %>%
+        group_nest(direction) %>%
+        with(
+          set_names(
+            map(data, ~unique(.x[["entrezgene_id"]])),
+            direction
+          )
+        )
+    ),
+    gene_set_name = lift(paste)(
+      select(., -results) %>%
+        as.list() %>%
+        {c("dge", .)},
+      sep = "_"
+    )
+  ) %>%
+  select(-results)
+
+qsave(
+  dge_gene_sets,
+  file.path(wd, "dge_gene_sets.qs"),
+  preset = "high"
+)
+
+# dge_gene_sets <- qread(file.path(wd, "dge_gene_sets.qs"))
+
+```
+
+
+```{r}
+activity <- synapser::Activity(
+  name = "Generate DGE gene sets",
+  used = c(
+    "syn25303172"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/07_query_clue.Rmd"
+)
+
+c(
+  file.path(wd, "dge_gene_sets.qs")
+) %>%
+  synStoreMany(parentId = "syn21547022", activity = activity, forceVersion = FALSE)
+```
+
+
+```{r pull_l1000_signatures}
+library(cmapR)
+
+cmap_paths <- list(
+  GSE92742 = "syn21551046",
+  GSE70138 = "syn21551043",
+  LINCS_2020 = "syn25050283"
+) %>%
+  enframe("dataset", "synid") %>%
+  mutate(
+    path = map_chr(synid, syn),
+    rids = map(
+      path,
+      read_gctx_ids, dim = "row"
+    ),
+    cids = map(
+      path,
+      read_gctx_ids, dim = "col"
+    )
+  )
+
+signatures_dge <- signature_meta %>%
+  distinct() %>%
+  drop_na(lspci_id) %>%
+  filter(lspci_id %in% deseq_res[["lspci_id"]])
+
+cmap_mats <- cmap_paths %>%
+  mutate(
+    mat = pmap(
+      list(path, rids, cids),
+      ~parse_gctx(..1, cid = which(..3 %in% signatures_dge[["sig_id"]]))
+    )
+  )
+
+cmap_mat <- cmap_mats %>%
+  pull(mat) %>%
+  map(~.x@mat[order(rownames(.x@mat)), ]) %>%
+  {do.call(cbind, .)} %>%
+  # Some signatures duplicated, removing them
+  {.[, !duplicated(colnames(.))]}
+
+cmap_df <- cmap_mat %>%
+  as_tibble(rownames = "pr_gene_id") %>%
+  mutate_at(vars(pr_gene_id), as.numeric) %>%
+  inner_join(
+    cmap_gene_meta %>%
+      distinct(pr_gene_id, entrez_id),
+    by = "pr_gene_id"
+  ) %>%
+  drop_na(entrez_id)
+
+# fwrite(
+#   cmap_df,
+#   file.path(wd, "cmap_signatures_profiled.csv.gz")
+# )
+
+fst::write_fst(
+  cmap_df,
+  file.path(wd, "cmap_signatures_profiled.fst")
+)
+
+# cmap_df <- read_fst(file.path(wd, "cmap_signatures_profiled.fst"))
+```
+
+```{r gene_sets_l1000}
+unloadNamespace("biomaRt")
+unloadNamespace("AnnotationDb")
+
+# Take only highest concentration / longest time
+selected_signatures <- signatures_dge %>%
+  semi_join(
+    arrange(., desc(pert_dose), desc(pert_time)) %>%
+      filter(pert_time <= 48) %>%
+      group_by(lspci_id, pert_iname, cell_id) %>%
+      slice(1) %>%
+      ungroup(),
+    by = c("lspci_id", "pert_iname", "cell_id", "pert_dose", "pert_time")
+  )
+
+zscores_selected_signatures <- cmap_df %>%
+  select(entrez_id, one_of(selected_signatures[["sig_id"]])) %>%
+  gather("sig_id", "zscore", -entrez_id) %>%
+  inner_join(
+    signatures_dge %>%
+      select(sig_id, lspci_id, cell_id, pert_dose, pert_time),
+    by = "sig_id"
+  )
+
+# Include a select couple of drugs where we query with each replicate separately
+cmap_replicate_included_drugs <- c(
+  "alvocidib",
+  "palbociclib"
+)
+
+# Include a select couple of drugs where we don't aggregate by cell line
+cmap_query_by_cell_line_drugs <- c(
+  "torin-1",
+  "alvocidib",
+  "palbociclib"
+)
+
+# Aggregating multiple cells using procedure by 10.1016/j.cell.2017.10.049
+zscores_selected_signatures_agg <- tribble(
+  ~cell_aggregate_method, ~replicate_method,
+  "per_cell_line", "per_replicate",
+  "per_cell_line", "replicates_aggregated",
+  "cells_aggregated", "replicates_aggregated"
+) %>%
+  mutate(
+    data = pmap(
+      .,
+      function(cell_aggregate_method, replicate_method) {
+        message(cell_aggregate_method, " ", replicate_method)
+        signatures <- zscores_selected_signatures %>%
+          filter(
+            if (replicate_method == "per_replicate")
+              lspci_id %in% filter(perturbation_meta, pert_iname %in% cmap_replicate_included_drugs)$lspci_id
+            else
+              TRUE,
+            if (cell_aggregate_method == "per_cell_line")
+              lspci_id %in% filter(perturbation_meta, pert_iname %in% cmap_query_by_cell_line_drugs)$lspci_id
+            else
+              TRUE,
+          ) %>%
+          setDT() %>%
+          unique()
+        if (replicate_method == "per_replicate") {
+          out <- signatures %>%
+            mutate(
+              replicate = as.factor(sig_id)
+            ) %>%
+            select(entrez_id, lspci_id, cell_id, sig_id, pert_dose, pert_time, replicate, zscore)
+        } else {
+          message("Aggregating replicates")
+          out <- signatures[
+            ,
+            .(zscore = mean(zscore), signatures = list(sig_id)),
+            keyby = c("entrez_id", "lspci_id", "cell_id", "pert_dose", "pert_time")
+          ]
+        }
+        if (cell_aggregate_method == "cells_aggregated") {
+          message("Aggregating cells")
+          out <- out[
+            # Then across cell lines
+            ,
+            .(
+              zscore = quantile(zscore, c(0.67, 0.33), names = FALSE) %>%
+                {.[order(abs(.))[2]]},
+              signatures = list(reduce(signatures, union) %>% na.omit())
+            ),
+            by = c("entrez_id", "lspci_id", "pert_dose", "pert_time")
+          ]
+        }
+        as_tibble(out)
+      }
+    )
+  )
+
+qsave(
+  zscores_selected_signatures_agg,
+  file.path(wd, "cmap_zscores_agg.qs")
+)
+
+# Using different quantile cutoffs for the z-score
+cmap_gene_sets <- zscores_selected_signatures_agg %>%
+  mutate(
+    data = map(
+      data,
+      ~.x %>%
+        mutate(entrezgene_id = as.character(entrez_id)) %>%
+        {suppressWarnings(join_hgnc(., "entrezgene_id", "entrez_id", "symbol"))} %>%
+        mutate(entrezgene_id = as.integer(entrezgene_id))
+    )
+  ) %>%
+  crossing(
+    cutoff = c(0.7, 0.8, 0.9, 0.95)
+  ) %>%
+  mutate(
+    data = map2(
+      data, cutoff,
+      ~.x %>%
+        filter(abs(zscore) > qnorm(.y)) %>%
+        arrange(desc(abs(zscore))) %>%
+        mutate(
+          direction = if_else(zscore > 0, "up", "down")
+        ) %>%
+        group_nest(
+          across(
+            any_of(
+              c("lspci_id", "cell_id", "replicate", "signatures", "sig_id", "pert_dose", "pert_time")
+            )
+          ),
+          .key = "gene_set_table"
+        )
+    )
+  ) %>%
+  unnest(data) %>%
+  mutate(
+    gene_set_name = select(., -starts_with("gene_set")) %>%
+      as.list() %>%
+      {c("cmap", .)} %>%
+      lift(paste)(sep = "_"),
+    gene_sets = map(
+      gene_set_table,
+      ~.x %>%
+        group_nest(direction) %>%
+        with(
+          set_names(
+            map(data, ~unique(.x[["entrezgene_id"]])),
+            direction
+          )
+        )
+    )
+  )
+
+qsave(
+  cmap_gene_sets,
+  file.path(wd, "cmap_gene_sets.qs"),
+  preset = "high"
+)
+
+# cmap_gene_sets <- qread(file.path(wd, "cmap_gene_sets.qs"))
+
+```
+
+
+```{r}
+activity <- synapser::Activity(
+  name = "Generate CMap gene sets",
+  used = c(
+    "syn25303172",
+    "syn21547101",
+    "syn21547097",
+    "syn21547102",
+    "syn21551046",
+    "syn21551043",
+    "syn25050283"
+  ),
+  executed = "https://github.com/clemenshug/dge_comparison/blob/master/07_query_clue.Rmd"
+)
+
+c(
+  file.path(wd, "cmap_gene_sets.qs"),
+  file.path(wd, "cmap_zscores_agg.qs"),
+  file.path(wd, "cmap_signatures_profiled.fst")
+) %>%
+  synStoreMany(parentId = "syn21547022", activity = activity)
+
+```
+
