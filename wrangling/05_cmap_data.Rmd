@@ -341,6 +341,7 @@ signature_meta_raw <- list(
 
 signature_meta <- signature_meta_raw %>%
   mutate(
+    cell_id = fcoalesce(cell_id, cell_iname),
     pert_dose = if_else(is.na(pert_dose), as.double(str_match(pert_idose, "([\\d\\.]+) um")[, 2]), pert_dose) %>%
       {if_else(. < 0, NA_real_, .)},
     pert_dose_unit = if_else(str_detect(pert_idose, "([\\d\\.]+) um"), "µM", pert_dose_unit),
@@ -409,7 +410,7 @@ c(
   here("wrangled", "cmap_signature_meta.csv.gz"),
   here("wrangled", "cmap_gene_meta.csv.gz")
 ) %>%
-  synStoreMany(parentId = "syn21547022", activity = activity, versionLabel = "Add new LINCS 2020 dataset")
+  synStoreMany(parentId = "syn21547022", activity = activity)
 
 #rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens/
 ```
