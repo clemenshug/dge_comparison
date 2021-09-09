@@ -249,7 +249,37 @@ fp_transdiff_meta <- fp_transdiff_meta_raw %>%
   # Experiment contains 4 identical plates
   crossing(plate = 1:4)
 ```
+```{r optimal_kinase_library_meta}
+lspci_id_canonical_names <- syn("syn24181333") %>%
+  read_csv()
 
+lspci_id_vendor_id_map <- syn("syn24183248") %>%
+  read_csv()
+
+okl_meta_raw <- syn("syn25764541") %>%
+  read_csv()
+
+okl_meta <- okl_meta_raw %>%
+  left_join(
+    lspci_id_vendor_id_map,
+    by = c("agent" = "vendor_id")
+  ) %>%
+  left_join(
+    lspci_id_canonical_names,
+    by = c("lspci_id")
+  ) %>%
+  transmute(
+    plate = 1,
+    replicate = 1,
+    well,
+    cells = cell_line,
+    drug = if_else(agent == "DMSO", "control", name),
+    lspci_id,
+    drug_conc = concentration,
+    time = timepoint
+  )
+
+```
 
 ```{r counts}
 dataset_syn <- tribble(
@@ -260,7 +290,8 @@ dataset_syn <- tribble(
   "lincs_cdk4_6_7", "syn21541479", "2019_08",
   "sr_repurposing", "syn21548149", "2018_02",
   "sr_repurposing", "syn21548150", "2018_11",
-  "fp_transdiff", "syn22041289", "2015_10"
+  "fp_transdiff", "syn22041289", "2015_10",
+  "okl", "syn26156493", "2021_08"
 ) %>%
   mutate(
     files = map(
@@ -388,7 +419,8 @@ meta_all <- tribble(
   "lincs_cdk4_6_7", cdk_new_meta, "2019_08",
   "sr_repurposing", sr_repurposing_meta1, "2018_02",
   "sr_repurposing", sr_repurposing_meta2, "2018_11",
-  "fp_transdiff", fp_transdiff_meta, "2015_10"
+  "fp_transdiff", fp_transdiff_meta, "2015_10",
+  "okl", okl_meta, "2021_08"
 ) %>%
   unnest(meta) %>%
   mutate(
@@ -458,11 +490,17 @@ cmdps_mapped_unique <- cmdps_mapped %>%
 
 condition_vars <- c("cells", "stim", "stim_conc", "drug_id", "drug_conc", "time")
 
-meta_cmpd_mapped <- meta_all %>%
-  left_join(
-    cmdps_mapped_unique,
-    by = "drug_norm"
-  ) %>%
+meta_cmpd_mapped <- meta_all %>% {
+  bind_rows(
+    filter(., is.na(lspci_id)) %>%
+      select(-lspci_id) %>%
+      left_join(
+        cmdps_mapped_unique,
+        by = "drug_norm"
+      ),
+    filter(., !is.na(lspci_id))
+  )
+} %>%
   mutate(
     # drug_id is either lspci_id or normalized drug name, if lspci_id was not found
     drug_id = if_else(!is.na(lspci_id), as.character(lspci_id), drug_norm)
@@ -513,7 +551,8 @@ dataset_names <- tribble(
   "lincs_cdk4_6_7", "2019_08_lincs_cdk4_6_7_inhibitors", "2019_08",
   "sr_repurposing", "2018_02_steven_rodriguez_ad_repurposing", "2018_02",
   "sr_repurposing", "2018_11_steven_rodriguez_ad_repurposing", "2018_11",
-  "fp_transdiff", "2015_10_feodor_price_transdifferentiation_screen", "2015_10"
+  "fp_transdiff", "2015_10_feodor_price_transdifferentiation_screen", "2015_10",
+  "okl", "2021_08_optimal_kinase_library", "2021_08"
 ) %>%
   mutate(
     dataset_name = as.factor(dataset_name) %>%
@@ -530,6 +569,7 @@ write_csv(
 ```
 
 ```{r synapse}
+
 activity <- synapser::Activity(
   name = "Wrangle DGE data",
   used = c(
@@ -538,6 +578,9 @@ activity <- synapser::Activity(
     "syn21542403",
     "syn21542711",
     "syn21586544",
+    "syn24181333",
+    "syn24183248",
+    "syn25764541",
     dataset_syn %>%
       select(-dataset, -folder_syn, -plate, -date) %>%
       reduce(union)
@@ -550,7 +593,7 @@ c(
   file.path(wd, "dataset_names.csv"), 
   file.path(wd, "meta_mapped.qs")
 ) %>%
-  synStoreMany(parentId = "syn21542764", activity = activity)
+  synStoreMany(parentId = "syn21542764", activity = activity, forceVersion = FALSE)
 
 #rsync -rv --exclude *.fq.gz --exclude fastq --exclude *.fastq.gz --exclude *.bam --exclude rapmap --exclude transcriptome 2018_02_steven_rodriguez_ad_repurposing transfer:/n/files/ImStor/sorger/data/rnaseq/lincs/dge_reanalysis_clemens/
 ```
