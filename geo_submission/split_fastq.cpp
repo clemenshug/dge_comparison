@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <regex>
 
-const std::regex FASTQ_HEADER_REGEX("^.*CELL_([A-Z]+):UMI_([A-Z]+)$");
+std::regex FASTQ_HEADER_REGEX("^.*CELL_([A-Z]+):UMI_([A-Z]+)$");
 
 bool get_read(std::istream& fastq_file, std::array<std::string, 4>& read) {
     std::string line;
@@ -20,15 +20,17 @@ bool get_read(std::istream& fastq_file, std::array<std::string, 4>& read) {
     return true;
 }
 
-void match_header(const std::string& header, std::array<std::string, 2>& header_vals) {
+std::array<std::string, 2> match_header(std::string header) {
     std::smatch match;
     std::regex_match(header, match, FASTQ_HEADER_REGEX);
     if (match.size() != 3) {
         std::cerr << "Could not match header: " << header << std::endl;
         exit(1);
     }
-    header_vals[0] = match[1];
-    header_vals[1] = match[2];
+    std::array<std::string, 2> result;
+    result[0] = match[1];
+    result[1] = match[2];
+    return result;
 }
 
 void process_fastq(
@@ -40,15 +42,14 @@ void process_fastq(
     std::array<std::string, 4> read;
     std::unordered_map<std::string, std::ofstream> output_files;
     size_t processed = 0;
-    std::array<std::string, 2> header_vals;
     while (get_read(fastq_file, read)) {
         processed++;
         if (processed % 1000000 == 0) {
             std::cout << "Processed " << processed << " reads" << std::endl;
         }
-        match_header(read[0], header_vals);
-        auto& barcode = header_vals[0];
-        auto& umi = header_vals[1];
+        std::array<std::string, 2> header_info = match_header(read[0]);
+        std::string barcode = header_info[0];
+        std::string umi = header_info[1];
         if (barcodes.find(barcode) == barcodes.end()) {
             continue;
         }
@@ -58,7 +59,7 @@ void process_fastq(
         }
         std::ofstream& output_file = output_files[barcode];
         for (int i = 0; i < 4; i++) {
-            output_file << read[i] << std::endl;
+            output_file << read[i] << "\n";
         }
     }
     for (auto& output_file : output_files) {
