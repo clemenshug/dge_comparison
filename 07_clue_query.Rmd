@@ -15,7 +15,7 @@ library(qs)
 library(fst)
 
 synapser::synLogin()
-syn <- synExtra::synDownloader("data")
+syn <- synExtra::synDownloader("data", ifcollision = "overwrite.local")
 
 wd <- here("clue_query")
 dir.create(wd, showWarnings = FALSE)
@@ -36,18 +36,46 @@ perturbation_meta <- syn("syn21547097") %>%
 
 cmap_gene_meta <- syn("syn21547102") %>%
   fread()
+
+cmap_gene_sets <- syn("syn25314203") %>%
+  qread()
+
+dge_gene_sets <- syn("syn25303778") %>%
+  qread()
+
+x <- signature_meta[
+  , .(cell_id, lspci_id)
+] %>%
+  unique() %>%
+  drop_na()
+
+y <- setDT(dge_gene_sets)[
+  , .(cell_id = cells, lspci_id)
+] %>%
+  unique() %>%
+  drop_na()
+
+inner_join(x, y) %>%
+  distinct()
 ```
 
 ```{r query_cmap}
 all_gene_sets <- list(
-  dge_gene_sets,
-  cmap_gene_sets
+  dge_gene_sets %>%
+    filter(concentration_method == "concentration_aggregated", replicate_method == "replicates_aggregated"),
+  cmap_gene_sets %>%
+    filter(cell_aggregate_method == "cells_aggregated", replicate_method == "replicates_aggregated")
 ) %>%
-  map(select, gene_set_name, gene_sets) %>%
+  map(mutate, across(replicate, as.factor)) %>%
+  map(mutate, across(gene_set_table, as.list)) %>%
+  # rbindlist(use.names = TRUE, fill = TRUE) %>%
   bind_rows()
 
+all_gene_sets_small <- all_gene_sets %>%
+  select(gene_set_id, gene_set_name, gene_sets)
+
 MAX_PER_QUERY = 25
-comp_res_clue <- all_gene_sets %>%
+comp_res_clue <- all_gene_sets_small %>%
   split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
   map(
     ~.x %>%
@@ -55,57 +83,71 @@ comp_res_clue <- all_gene_sets %>%
       unchop(gene_id) %>%
       # remove gene_ids that are in both up and down set
       # Can happen due to entrez_id mapping
-      group_by(gene_set_name, gene_id) %>%
+      group_by(id, gene_id) %>%
       filter(n() == 1) %>%
       ungroup() %>%
-      select(gene_set = gene_set_name, gene_id, direction)
+      select(gene_set = gene_set_id, gene_id, direction)
   ) %>%
   map(
     clue_gmt_from_df,
     drop_invalid = TRUE
   )
 
-comp_res_jobs <- comp_res_clue %>%
-  imap(
-    ~clue_query_submit(
-      .x[["up"]], .x[["down"]],
-      name = paste0("dge_job_", .y),
-      use_fast_tool = FALSE
+jobs <- clue_queries_submit(
+  comp_res_clue[-(1:62)]
+)
+
+all_jobs <- clue_list_jobs()
+
+dge_jobs <- all_jobs %>%
+  mutate(
+    name = .$params$name
+  ) %>%
+  filter(str_starts(name, "dge_job") | str_detect(name, "^\\d+$")) %>%
+  mutate(
+    dge_job_id = if_else(
+      str_starts(name, "dge_job"),
+      as.integer(str_replace(name, "dge_job_", "")),
+      as.integer(name)
     )
   )
 
-comp_res_jobs <- c(
-  "5eb305a5d58eba0011f9031c",
-  "5eb305a6ed2e4f0011539a5c",
-  "5eb305a6d58eba0011f9031e",
-  "5eb305a6ed2e4f0011539a5e",
-  "5eb305a6d58eba0011f90320",
-  "5eb305a7ed2e4f0011539a60"
-)
-
-failed_mask <- map(
-  comp_res_jobs,
-  clue_query_poll
-) %>%
-  map_lgl(~!identical(.x[["download_status"]], "completed"))
-
-resub_jobs <- comp_res_clue[failed_mask] %>%
-  imap(
-    ~clue_query_submit(
-      .x[["up"]], .x[["down"]],
-      name = paste0("dge_job_", .y),
-      use_fast_tool = FALSE
-    )
-  )
-
-walk(
-  comp_res_jobs,
-  clue_query_wait
-)
+succesful_mask <- dge_jobs$status == "completed"
 
 comp_res_clue_res <- map_chr(
-  comp_res_jobs,
-  clue_query_download
+  dge_jobs[succesful_mask,]$job_id %>%
+    set_names(dge_jobs[succesful_mask,]$dge_job_id),
+  clue_query_download, destination = wd
+)
+
+clue_res <- crossing(
+  score_type = "tau",
+  result_type = c("pert", "pcl"),
+  score_level = c("cell", "summary")
+) %>%
+  mutate(
+    data = pmap(
+      .,
+      function(...) {
+        comp_res_clue_res %>%
+          map(clue_parse_result, ...)
+      }
+    )
+  )
+
+qsave(
+  clue_res,
+  file.path(wd, "clue_res.qs")
+)
+# clue_res <- qread(file.path(wd, "clue_res.qs"))
+
+clue_res_long <- clue_res %>%
+  mutate(
+    data = map(data, rbindlist, use.names = TRUE)
+  )
+qsave(
+  clue_res_long,
+  file.path(wd, "clue_res_aggregate_only.qs")
 )
 
 ```
@@ -125,10 +167,9 @@ activity <- synapser::Activity(
 )
 
 c(
-  comp_res_clue_res
+  file.path(wd, "clue_res_aggregate_only.qs")
 ) %>%
-  synStoreMany(parentId = "syn21644366", activity = activity)
-
+  synStoreMany(parentId = "syn21644366", activity = activity, forceVersion = FALSE)
 
 ```
 
@@ -139,15 +180,23 @@ cdk_drugs <- c(
   palbociclib = 91464
 )
 
-cdk_gene_sets <- dge_gene_sets %>%
-  filter(
-    lspci_id %in% cdk_drugs,
-    concentration_method == "per_concentration",
-    replicate_method == "replicates_aggregated"
-  ) %>%
+cdk_gene_sets <- bind_rows(
+  dge_gene_sets %>%
+    filter(
+      lspci_id %in% cdk_drugs,
+      concentration_method == "per_concentration",
+      replicate_method == "replicates_aggregated"
+    ),
+  dge_gene_sets %>%
+    filter(
+      lspci_id %in% cdk_drugs,
+      concentration_method == "concentration_aggregated",
+      replicate_method == "per_replicate"
+    )
+) %>% 
   select(gene_set_name, gene_sets)
 
-MAX_PER_QUERY = 5
+MAX_PER_QUERY = 25
 clue_gene_sets <- cdk_gene_sets %>%
   split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
   map(
@@ -180,47 +229,9 @@ comp_res_clue <- clue_gene_sets %>%
   ) %>%
   discard(is.null)
 
-comp_res_jobs <- comp_res_clue %>%
-  imap(
-    ~clue_query_submit(
-      .x[["up"]], .x[["down"]],
-      name = paste0("dge_job_", .y),
-      use_fast_tool = FALSE
-    )
-  )
-
-x <- clue_query_submit(
-  comp_res_clue[[1]][["up"]], comp_res_clue[[1]][["down"]],
-  name = paste0("dge_job_fast"),
-  use_fast_tool = TRUE
+comp_res_jobs <- clue_queries_submit(
+  comp_res_clue
 )
-
-walk(
-  comp_res_jobs,
-  clue_query_wait
-)
-
-comp_res_jobs <- c(
-  "5ff8877d0eafdb0011e488d6",
-  "5ff8875eb5e100001293e846",
-  "5ff8873d0eafdb0011e488d4",
-  "5ff885f40eafdb0011e488d2"
-)
-
-failed_mask <- map(
-  comp_res_jobs,
-  clue_query_poll
-) %>%
-  map_lgl(~!identical(.x[["download_status"]], "completed"))
-
-resub_jobs <- comp_res_clue[failed_mask] %>%
-  imap(
-    ~clue_query_submit(
-      .x[["up"]], .x[["down"]],
-      name = paste0("dge_job_", .y),
-      use_fast_tool = FALSE
-    )
-  )
 
 walk(
   comp_res_jobs,
@@ -229,7 +240,7 @@ walk(
 
 comp_res_clue_res <- map_chr(
   comp_res_jobs,
-  clue_query_download
+  clue_query_download, destination = wd
 )
 
 ```

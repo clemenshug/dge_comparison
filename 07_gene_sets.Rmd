@@ -17,7 +17,7 @@ library(qs)
 library(fst)
 
 synapser::synLogin()
-syn <- synExtra::synDownloader("data")
+syn <- synExtra::synDownloader("data", ifcollision = "overwrite.local")
 
 wd <- here("clue_query")
 dir.create(wd, showWarnings = FALSE)
@@ -93,7 +93,10 @@ dge_gene_sets <- deseq_res %>%
       sep = "_"
     )
   ) %>%
-  select(-results)
+  select(-results) %>%
+  mutate(
+    gene_set_id = paste0("dge_", seq_len(n()))
+  )
 
 qsave(
   dge_gene_sets,
@@ -209,6 +212,9 @@ zscores_selected_signatures <- cmap_df %>%
       select(sig_id, lspci_id, cell_id, pert_dose, pert_time),
     by = "sig_id"
   )
+
+qsave(zscores_selected_signatures, file.path(wd, "z_scores_selected_signatures.qs"))
+# zscores_selected_signatures <- qread(file.path(wd, "z_scores_selected_signatures.qs"))
 
 # Include a select couple of drugs where we query with each replicate separately
 cmap_replicate_included_drugs <- c(
@@ -335,6 +341,9 @@ cmap_gene_sets <- zscores_selected_signatures_agg %>%
           )
         )
     )
+  ) %>%
+  mutate(
+    gene_set_id = paste0("cmap_", seq_len(n()))
   )
 
 qsave(
@@ -368,7 +377,7 @@ c(
   file.path(wd, "cmap_zscores_agg.qs"),
   file.path(wd, "cmap_signatures_profiled.fst")
 ) %>%
-  synStoreMany(parentId = "syn21547022", activity = activity)
+  synStoreMany(parentId = "syn21547022", activity = activity, forceVersion = FALSE)
 
 ```
 
