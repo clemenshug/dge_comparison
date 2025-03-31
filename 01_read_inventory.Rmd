@@ -3,6 +3,7 @@
 library(tidyverse)
 library(synExtra)
 library(here)
+library(qs)
 
 synapser::synLogin()
 syn <- synExtra::synDownloader("~/data/DGE_comp/")
@@ -13,8 +14,8 @@ dir.create(wd, showWarnings = FALSE)
 
 
 ```{r loading}
-datasets <- syn("syn21544261") %>%
-  read_rds()
+datasets <- syn("syn25292308") %>%
+  qread()
 
 fastq_counts <- syn("syn21542323") %>%
   read_csv()
@@ -32,8 +33,7 @@ count_stats <- datasets %>%
       count,
       ~.x %>%
         group_by(sample_id) %>%
-        summarize(count = sum(count)) %>%
-        ungroup()
+        summarize(count = sum(count), .groups = "drop")
     )
   ) %>%
   unnest(count)
@@ -41,8 +41,7 @@ count_stats <- datasets %>%
 dataset_stats <- count_stats %>%
   drop_na(sample_id) %>%
   group_by(dataset, batch, plate, date, count_type) %>%
-  summarize(count = sum(count)) %>%
-  ungroup() %>%
+  summarize(count = sum(count), .groups = "drop") %>%
   mutate_at(vars(plate), as.numeric) %>%
   bind_rows(
     fastq_counts %>%
@@ -83,13 +82,20 @@ count_names <- tribble(
       fct_inorder()
   )
 
-dataset_stats_bars <- dataset_stats %>%
-  inner_join(dataset_names) %>%
-  inner_join(count_names) %>%
-  mutate(
-    dataset_name = fct_cross(dataset_name, as.factor(plate) %>% fct_inseq(), sep = "_"),
-    count_type_name = fct_rev(count_type_name)
+dataset_stats_plot_data <- dataset_stats %>%
+  inner_join(
+    dataset_names %>%
+      arrange(date) %>%
+      mutate(across(dataset_name, fct_inorder))
   ) %>%
+  inner_join(count_names) %>%
+  arrange(dataset_name, plate) %>%
+  mutate(
+    dataset_name = fct_inorder(paste(dataset_name,  plate, sep = "_")),
+    count_type_name = fct_rev(count_type_name)
+  )
+
+dataset_stats_bars <- dataset_stats_plot_data %>%
   ggplot(aes(dataset_name, count_prev_fraction, fill = count_type_name)) +
     geom_col(position = "dodge") +
     coord_flip() +
@@ -103,13 +109,7 @@ ggsave(
 )
 
 
-dataset_remaining_stats_bars <- dataset_stats %>%
-  inner_join(dataset_names) %>%
-  inner_join(count_names) %>%
-  mutate(
-    dataset_name = fct_cross(dataset_name, as.factor(plate) %>% fct_inseq(), sep = "_"),
-    count_type_name = fct_rev(count_type_name)
-  ) %>%
+dataset_remaining_stats_bars <- dataset_stats_plot_data %>%
   ggplot(aes(dataset_name, count_fraction, fill = count_type_name)) +
     geom_col(position = "dodge") +
     coord_flip() +
@@ -122,13 +122,7 @@ ggsave(
   dataset_remaining_stats_bars, width = 8, height = 4
 )
 
-dataset_stats_bars_abs <- dataset_stats %>%
-  inner_join(dataset_names) %>%
-  inner_join(count_names) %>%
-  mutate(
-    dataset_name = fct_cross(dataset_name, as.factor(plate) %>% fct_inseq(), sep = "_"),
-    count_type_name = fct_rev(count_type_name)
-  ) %>%
+dataset_stats_bars_abs <- dataset_stats_plot_data %>%
   ggplot(aes(dataset_name, count, fill = count_type_name)) +
     geom_col(position = "dodge") +
     coord_flip() +

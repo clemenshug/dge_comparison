@@ -15,7 +15,7 @@ library(qs)
 library(fst)
 
 synapser::synLogin()
-syn <- synExtra::synDownloader("data", ifcollision = "overwrite.local")
+syn <- synExtra::synDownloader("data", .cache = TRUE)
 
 wd <- here("clue_query")
 dir.create(wd, showWarnings = FALSE)
@@ -37,11 +37,25 @@ perturbation_meta <- syn("syn21547097") %>%
 cmap_gene_meta <- syn("syn21547102") %>%
   fread()
 
-cmap_gene_sets <- syn("syn25314203") %>%
+cmap_gene_sets <- syn("syn27768305") %>%
   qread()
 
 dge_gene_sets <- syn("syn25303778") %>%
   qread()
+
+compound_names <- syn("syn26260344") %>%
+  read_csv() %>%
+  select(lspci_id, name) %>%
+  drop_na() %>%
+  bind_rows(
+    anti_join(perturbation_meta, ., by = "lspci_id") %>%
+      select(name = pert_iname, lspci_id) %>%
+      drop_na(name)
+  ) %>%
+  group_by(lspci_id) %>%
+  slice(1) %>%
+  ungroup()
+
 
 x <- signature_meta[
   , .(cell_id, lspci_id)
@@ -55,37 +69,92 @@ y <- setDT(dge_gene_sets)[
   unique() %>%
   drop_na()
 
-inner_join(x, y) %>%
+complete_overlap <- inner_join(x, y) %>%
   distinct()
 ```
 
-```{r query_cmap}
-all_gene_sets <- list(
-  dge_gene_sets %>%
-    filter(concentration_method == "concentration_aggregated", replicate_method == "replicates_aggregated"),
-  cmap_gene_sets %>%
-    filter(cell_aggregate_method == "cells_aggregated", replicate_method == "replicates_aggregated")
-) %>%
-  map(mutate, across(replicate, as.factor)) %>%
-  map(mutate, across(gene_set_table, as.list)) %>%
-  # rbindlist(use.names = TRUE, fill = TRUE) %>%
-  bind_rows()
 
-all_gene_sets_small <- all_gene_sets %>%
-  select(gene_set_id, gene_set_name, gene_sets)
+```{r }
+selected_cmap_gene_set_meta <- cmap_gene_sets[cell_aggregate_method == "per_cell_line" & replicate_method == "replicates_aggregated" & cutoff == 0.7][["data"]][[1]] %>%
+  arrange(lspci_id, desc(pert_time), desc(pert_dose)) %>%
+  group_by(lspci_id) %>%
+  mutate(
+    # Prefer 24h. If not available take whatever is closest after.
+    # If nothing later, take closest earlier
+    pert_time_fct = factor(
+      pert_time,
+      levels = {
+        times <- unique(pert_time)
+        after <- times[times > 24]
+        before <- times[times < 24]
+        c(24, after, before)
+      }
+    ),
+    # Take dose closest to 10
+    pert_dose_diff = abs(10 - pert_dose)
+  ) %>%
+  arrange(pert_time_fct, pert_dose_diff, .by_group = TRUE) %>%
+  # Take only MCF7 for cell-line specific queries
+  filter(cell_id == "MCF7") %>%
+  filter(pert_time_fct == pert_time_fct[1]) %>%
+  filter(pert_dose == pert_dose[1]) %>%
+  ungroup() %>%
+  select(-gene_set_table)
+
+selected_cmap_gene_sets <- rbindlist(
+  list(
+    # Only query with TORIN-1 at all cutoffs
+    different_cutoffs = cmap_gene_sets %>%
+      mutate(
+        data = map(data, ~semi_join(.x, filter(selected_cmap_gene_set_meta, lspci_id %in% filter(compound_names, name == "TORIN1")$lspci_id)))
+      ),
+    # For compound / cell line combos with complete overlap
+    # query with single cell line
+    per_replicate = cmap_gene_sets %>%
+      filter(replicate_method == "replicates_aggregated", cell_aggregate_method == "per_cell_line", cutoff == 0.7) %>%
+      mutate(
+        data = map(data, ~semi_join(semi_join(.x, complete_overlap), selected_cmap_gene_set_meta))
+      ),
+    # Query all DGE profiled drugs at 0.7 threshold and cells / replicates aggregated
+    all_profiled = cmap_gene_sets %>%
+      filter(replicate_method == "replicates_aggregated", cell_aggregate_method == "cells_aggregated", cutoff == 0.7) %>%
+      mutate(
+        data = map(data, ~semi_join(semi_join(.x, tibble(lspci_id = unique(na.omit(dge_gene_sets$lspci_id)))), selected_cmap_gene_set_meta))
+      )
+  ), use.names = TRUE, idcol = "gene_set_type"
+) %>%
+  unnest(data) %>%
+  mutate(
+    gene_set = map(
+      gene_set_table,
+      ~.x %>%
+        group_by(direction) %>%
+        slice_head(n = 150) %>%
+        ungroup() %>%
+        inner_join(
+          distinct(cmap_gene_meta, pr_gene_id, entrez_gene_id = entrez_id)
+        ) %>%
+        # Rarely, a gene can be both in up and down set due to
+        # gene id mapping. Keeping random
+        group_by(entrez_gene_id) %>%
+        slice_sample(n = 1) %>%
+        ungroup() %>%
+        select(gene_id = entrez_gene_id, direction)
+    ),
+    gene_set_id = paste0("cmap_", seq_len(n()))
+  )
+
+```
+
+```{r query_cmap}
 
 MAX_PER_QUERY = 25
-comp_res_clue <- all_gene_sets_small %>%
+comp_res_clue <- selected_cmap_gene_sets %>%
+  select(gene_set_id, gene_set) %>%
   split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
   map(
     ~.x %>%
-      unnest_longer(gene_sets, indices_to = "direction", values_to = "gene_id") %>%
-      unchop(gene_id) %>%
-      # remove gene_ids that are in both up and down set
-      # Can happen due to entrez_id mapping
-      group_by(id, gene_id) %>%
-      filter(n() == 1) %>%
-      ungroup() %>%
+      unnest(gene_set) %>%
       select(gene_set = gene_set_id, gene_id, direction)
   ) %>%
   map(
@@ -94,7 +163,7 @@ comp_res_clue <- all_gene_sets_small %>%
   )
 
 jobs <- clue_queries_submit(
-  comp_res_clue[-(1:62)]
+  comp_res_clue
 )
 
 all_jobs <- clue_list_jobs()
@@ -174,7 +243,112 @@ c(
 ```
 
 
-```{r query_cmap_cdk_only}
+For torin-1, query using every cell type separately
+
+```{r torin-1}
+
+torin_gene_sets <- cmap_gene_sets %>%
+  filter(cell_aggregate_method == "per_cell_line", replicate_method == "replicates_aggregated", cutoff == 0.7) %>%
+  chuck("data", 1) %>%
+  filter(lspci_id == 101068) %>%
+  mutate(
+    gene_set_id = paste0("l1000_torin_", seq_len(n()))
+  )
+
+torin_gene_sets_small <- torin_gene_sets %>%
+  select(gene_set_id, gene_sets)
+
+MAX_PER_QUERY = 25
+comp_res_clue <- torin_gene_sets_small %>%
+  split(ceiling(seq_len(nrow(.)) / MAX_PER_QUERY)) %>%
+  map(
+    ~.x %>%
+      unnest_longer(gene_sets, indices_to = "direction", values_to = "gene_id") %>%
+      unchop(gene_id) %>%
+      # remove gene_ids that are in both up and down set
+      # Can happen due to entrez_id mapping
+      group_by(gene_set_id, gene_id) %>%
+      filter(n() == 1) %>%
+      ungroup() %>%
+      select(gene_set = gene_set_id, gene_id, direction)
+  ) %>%
+  map(
+    clue_gmt_from_df,
+    drop_invalid = TRUE
+  )
+
+jobs <- clue_queries_submit(
+  comp_res_clue
+)
+
+all_jobs <- clue_list_jobs()
+
+dge_jobs <- all_jobs %>%
+  mutate(
+    name = .$params$name
+  ) %>%
+  filter(str_starts(name, "dge_job") | str_detect(name, "^\\d+$")) %>%
+  mutate(
+    dge_job_id = if_else(
+      str_starts(name, "dge_job"),
+      as.integer(str_replace(name, "dge_job_", "")),
+      as.integer(name)
+    )
+  )
+
+succesful_mask <- dge_jobs$status == "completed"
+
+comp_res_clue_res <- map_chr(
+  dge_jobs[succesful_mask,]$job_id %>%
+    set_names(dge_jobs[succesful_mask,]$dge_job_id),
+  clue_query_download, destination = wd
+)
+
+clue_res <- crossing(
+  score_type = "tau",
+  result_type = c("pert", "pcl"),
+  score_level = c("cell", "summary")
+) %>%
+  mutate(
+    data = pmap(
+      .,
+      function(...) {
+        comp_res_clue_res %>%
+          map(clue_parse_result, ...)
+      }
+    )
+  )
+
+qsave(
+  clue_res,
+  file.path(wd, "clue_res.qs")
+)
+# clue_res <- qread(file.path(wd, "clue_res.qs"))
+
+clue_res_long <- clue_res %>%
+  mutate(
+    data = map(data, rbindlist, use.names = TRUE)
+  )
+qsave(
+  clue_res_long,
+  file.path(wd, "clue_res_aggregate_only.qs")
+)
+
+
+```
+
+
+For a subset of drugs / cell line combinations query
+with each concentration / replicate separately
+
+```{r query_cmap_non_agg}
+matching <- inner_join(
+    cmap_gene_sets %>%
+      distinct(cell_id, lspci_id),
+    dge_gene_sets %>%
+      distinct(cell_id = cells, lspci_id)
+  )
+
 cdk_drugs <- c(
   ribociclib = 89588,
   palbociclib = 91464
@@ -372,104 +546,6 @@ c(
   new_names
 ) %>%
   synStoreMany(parentId = "syn21644366", activity = activity)
-
-```
-
-
-```{r}
-clue_res_raw <- synChildren("syn21644366") %>%
-  map(syn) %>%
-  keep(function(x) length(x) > 0)
-
-# clue_res_raw %>%
-#   magrittr::extract(str_starts(names(.), "my_")) %>%
-#   map(synapser::synMove, new_parent = "syn22024427")
-
-clue_res <- crossing(
-  score_type = "tau",
-  result_type = c("pert", "pcl"),
-  score_level = c("cell", "summary")
-) %>%
-  mutate(
-    data = pmap(
-      .,
-      function(...) {
-        clue_res_raw %>%
-          map(clue_parse_result, ...) %>%
-          bind_rows(.id = "query_type") %>%
-          mutate(
-            query_type = case_when(
-              str_detect(query_type, fixed("measured_only")) ~ "measured_only",
-              str_detect(query_type, fixed("per_cell_line")) ~ "per_cell_line",
-              TRUE ~ "aggregated"
-            )
-          )
-      }
-    )
-  )
-
-write_rds(
-  clue_res,
-  file.path(wd, "clue_results_conc.rds"),
-  compress = "gz"
-)
-```
-
-
-```{r synapse}
-c(
-  # file.path(wd, "cmap_signatures_profiled.rds"),
-  file.path(wd, "clue_results_conc.rds")
-) %>%
-  synStoreMany(parentId = "syn21547022", activity = activity)
-```
-
-
-```{r save_gene_sets}
-all_gene_sets <- tribble(
-  ~source, ~data,
-  "dge", dge_gene_sets %>%
-    transmute(
-      concentration_method, replicate_method,
-      drug_id, lspci_id, cell_id = cells, stim, stim_conc, time, dataset,
-      replicate = as.factor(replicate), drug_conc, gene_set_name,
-      gene_set_table
-    ) %>% unnest(gene_set_table) %>%
-    select(-ensembl_gene_id, -baseMean, -lfcSE, -pvalue, -log2FoldChange_MLE),
-  "l1000", cmap_gene_sets %>%
-    select(
-      cell_aggregate_method, replicate_method,
-      lspci_id, cell_id, replicate, cutoff, gene_set_name,
-      gene_set_table
-    ) %>%
-    unnest(gene_set_table) %>%
-    select(-entrez_id, -symbol)
-) %>%
-  unnest(data) %>%
-  distinct()
-
-fwrite(
-  all_gene_sets,
-  file.path(wd, "all_gene_sets.csv.gz")
-)
-
-activity <- synapser::Activity(
-  name = "Query clue",
-  used = c(
-    "syn21559859",
-    "syn21547101",
-    "syn21547097",
-    "syn21547102",
-    "syn21551046",
-    "syn21551043"
-  ),
-  executed = "https://github.com/clemenshug/dge_comparison/blob/master/07_query_clue.Rmd"
-)
-
-c(
-  file.path(wd, "all_gene_sets.csv.gz")
-) %>%
-  synStoreMany(parentId = "syn21547022", activity = activity)
 
 ```
 

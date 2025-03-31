@@ -17,7 +17,7 @@ library(qs)
 library(fst)
 
 synapser::synLogin()
-syn <- synExtra::synDownloader("data", ifcollision = "overwrite.local")
+syn <- synExtra::synDownloader("~/data", .cache = TRUE)
 
 wd <- here("clue_query")
 dir.create(wd, showWarnings = FALSE)
